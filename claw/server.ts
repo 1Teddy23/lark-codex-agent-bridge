@@ -1,0 +1,3100 @@
+/**
+ * 飞书长连接 → Cursor Agent CLI 中继服务 v3
+ *
+ * 直连方案：飞书 SDK ↔ Cursor Agent CLI
+ * - 飞书消息直达 Cursor，零提示词污染
+ * - 普通互动卡片回复 + 消息更新（无需 CardKit 权限）
+ * - 支持文字、图片、语音、文件、富文本
+ * - 长消息自动分片
+ *
+ * 启动: bun run server.ts
+ */
+import * as Lark from "@larksuiteoapi/node-sdk";
+import { spawn, execFileSync } from "node:child_process";
+import { readFileSync, readdirSync, statSync, watchFile, mkdirSync, writeFileSync, unlinkSync, existsSync } from "node:fs";
+import { extname, resolve } from "node:path";
+import { Readable } from "node:stream";
+import { gzipSync, gunzipSync } from "node:zlib";
+import { randomUUID } from "node:crypto";
+import WebSocket from "ws";
+import { MemoryManager } from "./memory.js";
+import { Scheduler, type CronJob } from "./scheduler.js";
+import { HeartbeatRunner } from "./heartbeat.js";
+
+const HOME = process.env.HOME;
+if (!HOME) throw new Error("$HOME is not set");
+
+const ROOT = resolve(import.meta.dirname, "..");
+const ENV_PATH = resolve(import.meta.dirname, ".env");
+const PROJECTS_PATH = resolve(ROOT, "projects.json");
+const AGENT_BIN = process.env.AGENT_BIN || resolve(HOME, ".local/bin/agent");
+const INBOX_DIR = resolve(ROOT, "inbox");
+const ACTIVE_TASKS_PATH = resolve(ROOT, "runtime", "active-tasks.json");
+
+mkdirSync(INBOX_DIR, { recursive: true });
+
+function readUtf8Text(path: string): string {
+	return readFileSync(path, "utf-8").replace(/^\uFEFF/, "");
+}
+
+// 启动时清理超过 24h 的临时文件
+const DAY_MS = 24 * 60 * 60 * 1000;
+for (const f of readdirSync(INBOX_DIR)) {
+	const p = resolve(INBOX_DIR, f);
+	try { if (Date.now() - statSync(p).mtimeMs > DAY_MS) unlinkSync(p); } catch {}
+}
+
+process.on("uncaughtException", (err) => {
+	console.error(`[未捕获异常] ${err.message}\n${err.stack}`);
+	// An uncaught exception can leave the WebSocket client in an unknown state.
+	// Exit so scripts/start.ps1 can bring up a clean bridge instance.
+	setTimeout(() => process.exit(1), 0).unref();
+});
+process.on("unhandledRejection", (reason) => {
+	console.error("[未处理 Promise 拒绝]", reason);
+});
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+	process.on(signal, () => {
+		console.warn(`[服务] 收到 ${signal}，正在退出`);
+	});
+}
+process.on("exit", (code) => {
+	console.warn(`[服务] 进程退出，code=${code}`);
+});
+
+// ── .env 热更换 ──────────────────────────────────
+interface EnvConfig {
+	CURSOR_API_KEY: string;
+	FEISHU_APP_ID: string;
+	FEISHU_APP_SECRET: string;
+	FEISHU_USER_ACCESS_TOKEN: string;
+	FEISHU_REFRESH_TOKEN: string;
+	CURSOR_MODEL: string;
+	CODEX_AGENT_TIMEOUT_MS: string;
+	VOLC_STT_APP_ID: string;
+	VOLC_STT_ACCESS_TOKEN: string;
+	VOLC_EMBEDDING_API_KEY: string;
+	VOLC_EMBEDDING_MODEL: string;
+}
+
+function parseEnv(): EnvConfig {
+	if (!existsSync(ENV_PATH)) {
+		console.error(`[致命] .env 文件不存在: ${ENV_PATH}`);
+		process.exit(1);
+	}
+	const raw = readUtf8Text(ENV_PATH);
+	const env: Record<string, string> = {};
+	for (const line of raw.split("\n")) {
+		const trimmed = line.trim();
+		if (!trimmed || trimmed.startsWith("#")) continue;
+		const eqIdx = trimmed.indexOf("=");
+		if (eqIdx < 0) continue;
+		let val = trimmed.slice(eqIdx + 1).trim();
+		// 去除引号包裹
+		if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+			val = val.slice(1, -1);
+		}
+		env[trimmed.slice(0, eqIdx).trim()] = val;
+	}
+	return {
+		CURSOR_API_KEY: env.CURSOR_API_KEY || "",
+		FEISHU_APP_ID: env.FEISHU_APP_ID || "",
+		FEISHU_APP_SECRET: env.FEISHU_APP_SECRET || "",
+		FEISHU_USER_ACCESS_TOKEN: env.FEISHU_USER_ACCESS_TOKEN || "",
+		FEISHU_REFRESH_TOKEN: env.FEISHU_REFRESH_TOKEN || "",
+		CURSOR_MODEL: env.CURSOR_MODEL || "opus-4.6-thinking",
+		CODEX_AGENT_TIMEOUT_MS: env.CODEX_AGENT_TIMEOUT_MS || "0",
+		VOLC_STT_APP_ID: env.VOLC_STT_APP_ID || "",
+		VOLC_STT_ACCESS_TOKEN: env.VOLC_STT_ACCESS_TOKEN || "",
+		VOLC_EMBEDDING_API_KEY: env.VOLC_EMBEDDING_API_KEY || "",
+		VOLC_EMBEDDING_MODEL: env.VOLC_EMBEDDING_MODEL || "doubao-embedding-vision-250615",
+	};
+}
+
+let config = parseEnv();
+watchFile(ENV_PATH, { interval: 2000 }, () => {
+	try {
+		const prev = config.CURSOR_API_KEY;
+		config = parseEnv();
+		if (config.CURSOR_API_KEY !== prev) {
+			console.log(`[热更换] API Key 已更新 (...${config.CURSOR_API_KEY.slice(-8)})`);
+		} else {
+			console.log("[热更换] .env 已重新加载");
+		}
+	} catch {}
+});
+
+// ── 项目配置 ─────────────────────────────────────
+interface ProjectsConfig {
+	projects: Record<string, { path: string; description: string }>;
+	default_project: string;
+}
+if (!existsSync(PROJECTS_PATH)) {
+	console.error(`[致命] projects.json 不存在: ${PROJECTS_PATH}`);
+	process.exit(1);
+}
+let projectsConfig: ProjectsConfig = JSON.parse(readUtf8Text(PROJECTS_PATH));
+watchFile(PROJECTS_PATH, { interval: 5000 }, () => {
+	try {
+		projectsConfig = JSON.parse(readUtf8Text(PROJECTS_PATH));
+	} catch {}
+});
+
+// ── 工作区模板自动初始化 ─────────────────────────
+const TEMPLATE_DIR = resolve(import.meta.dirname, "templates");
+const WORKSPACE_FILES = [
+	".cursor/SOUL.md", ".cursor/IDENTITY.md", ".cursor/USER.md",
+	".cursor/MEMORY.md", ".cursor/HEARTBEAT.md", ".cursor/TASKS.md",
+	".cursor/BOOT.md", ".cursor/TOOLS.md",
+];
+const WORKSPACE_RULES = [
+	".cursor/rules/soul.mdc",
+	".cursor/rules/agent-identity.mdc",
+	".cursor/rules/user-context.mdc",
+	".cursor/rules/workspace-rules.mdc",
+	".cursor/rules/tools.mdc",
+	".cursor/rules/memory-protocol.mdc",
+	".cursor/rules/scheduler-protocol.mdc",
+	".cursor/rules/heartbeat-protocol.mdc",
+	".cursor/rules/cursor-capabilities.mdc",
+];
+
+function ensureWorkspace(wsPath: string): boolean {
+	mkdirSync(resolve(wsPath, ".cursor/memory"), { recursive: true });
+	mkdirSync(resolve(wsPath, ".cursor/sessions"), { recursive: true });
+	mkdirSync(resolve(wsPath, ".cursor/rules"), { recursive: true });
+	mkdirSync(resolve(wsPath, ".cursor/skills"), { recursive: true });
+
+	const isNewWorkspace = !existsSync(resolve(wsPath, ".cursor/SOUL.md"));
+	let copied = 0;
+
+	// AGENTS.md 放在根目录（Cursor 自动加载约定）
+	const rootFiles = ["AGENTS.md"];
+	// 首次初始化时额外复制 BOOTSTRAP.md（仅新工作区）
+	const allFiles = isNewWorkspace
+		? [...rootFiles, ...WORKSPACE_FILES, ".cursor/BOOTSTRAP.md", ...WORKSPACE_RULES]
+		: [...rootFiles, ...WORKSPACE_FILES, ...WORKSPACE_RULES];
+
+	for (const f of allFiles) {
+		const target = resolve(wsPath, f);
+		if (!existsSync(target)) {
+			const src = resolve(TEMPLATE_DIR, f);
+			if (existsSync(src)) {
+				writeFileSync(target, readFileSync(src, "utf-8"));
+				console.log(`[工作区] 从模板复制: ${f}`);
+				copied++;
+			}
+		}
+	}
+
+	// Skills（Cursor 官方 skill 规范：.cursor/skills/skill-name/SKILL.md）
+	const skillsSrc = resolve(TEMPLATE_DIR, ".cursor/skills");
+	if (existsSync(skillsSrc)) {
+		for (const name of readdirSync(skillsSrc)) {
+			const srcDir = resolve(skillsSrc, name);
+			if (!statSync(srcDir).isDirectory()) continue;
+			const targetSkill = resolve(wsPath, `.cursor/skills/${name}/SKILL.md`);
+			if (!existsSync(targetSkill)) {
+				const targetDir = resolve(wsPath, `.cursor/skills/${name}`);
+				mkdirSync(targetDir, { recursive: true });
+				for (const file of readdirSync(srcDir)) {
+					writeFileSync(resolve(targetDir, file), readFileSync(resolve(srcDir, file), "utf-8"));
+				}
+				console.log(`[工作区] 从模板复制 skill: ${name}`);
+				copied++;
+			}
+		}
+	}
+
+	if (copied > 0) {
+		console.log(`[工作区] ${wsPath} 初始化完成 (${copied} 个文件)`);
+		if (isNewWorkspace) {
+			console.log("[工作区] 首次启动：.cursor/BOOTSTRAP.md 已就绪，首次对话将触发出生仪式");
+		}
+	}
+	return isNewWorkspace;
+}
+
+// ── 记忆管理器 ───────────────────────────────────
+const defaultWorkspace = projectsConfig.projects[projectsConfig.default_project]?.path || ROOT;
+ensureWorkspace(defaultWorkspace);
+let memory: MemoryManager | undefined;
+if (!config.VOLC_EMBEDDING_API_KEY) {
+	console.log("[记忆] 未配置 VOLC_EMBEDDING_API_KEY，语义记忆已禁用");
+} else {
+	try {
+		memory = new MemoryManager({
+			workspaceDir: defaultWorkspace,
+			embeddingApiKey: config.VOLC_EMBEDDING_API_KEY,
+			embeddingModel: config.VOLC_EMBEDDING_MODEL,
+			embeddingEndpoint: "https://ark.cn-beijing.volces.com/api/v3/embeddings/multimodal",
+		});
+		setTimeout(() => {
+			memory!.index().then((n) => {
+				if (n > 0) console.log(`[记忆] 启动索引完成: ${n} 块`);
+			}).catch((e) => console.warn(`[记忆] 启动索引失败: ${e}`));
+		}, 3000);
+	} catch (e) {
+		console.warn(`[记忆] 初始化失败（功能降级）: ${e}`);
+	}
+}
+
+// ── 最近活跃会话（用于定时任务/心跳主动推送）─────
+let lastActiveChatId: string | undefined;
+
+// ── 定时任务调度器 ────────────────────────────────
+const cronStorePath = resolve(defaultWorkspace, "cron-jobs.json");
+
+const scheduler = new Scheduler({
+	storePath: cronStorePath,
+	defaultWorkspace,
+	onExecute: async (job: CronJob) => {
+		try {
+			const ws = job.workspace || defaultWorkspace;
+			memory?.appendSessionLog(ws, "user", `[定时任务:${job.name}] ${job.message}`, config.CURSOR_MODEL);
+			const { result } = await runAgent(ws, job.message, {
+				sessionKey: `${ws}::system:scheduler:${job.id}`,
+			});
+			memory?.appendSessionLog(ws, "assistant", result.slice(0, 3000), config.CURSOR_MODEL);
+			return { status: "ok" as const, result };
+		} catch (err) {
+			return { status: "error" as const, error: err instanceof Error ? err.message : String(err) };
+		}
+	},
+	onDelivery: async (job: CronJob, result: string) => {
+		if (!lastActiveChatId) {
+			console.warn("[调度] 无活跃会话，跳过发送");
+			return;
+		}
+		const title = `⏰ 定时任务: ${job.name}`;
+		if (result.length <= 3800) {
+			await sendCard(lastActiveChatId, result, { title, color: "purple" });
+		} else {
+			await sendCard(lastActiveChatId, result.slice(0, 3800) + "\n\n...(已截断)", { title, color: "purple" });
+		}
+	},
+	log: (msg: string) => console.log(`[调度] ${msg}`),
+});
+
+// ── 心跳系统 ──────────────────────────────────────
+const heartbeat = new HeartbeatRunner({
+	config: {
+		enabled: false,
+		everyMs: 30 * 60 * 1000,
+		workspaceDir: defaultWorkspace,
+	},
+	onExecute: async (prompt: string) => {
+		memory?.appendSessionLog(defaultWorkspace, "user", "[心跳检查] " + prompt.slice(0, 200), config.CURSOR_MODEL);
+		const { result } = await runAgent(defaultWorkspace, prompt, {
+			sessionKey: `${defaultWorkspace}::system:heartbeat`,
+		});
+		memory?.appendSessionLog(defaultWorkspace, "assistant", result.slice(0, 3000), config.CURSOR_MODEL);
+		return result;
+	},
+	onDelivery: async (content: string) => {
+		if (!lastActiveChatId) {
+			console.warn("[心跳] 无活跃会话，跳过发送");
+			return;
+		}
+		await sendCard(lastActiveChatId, content, { title: "💓 心跳检查", color: "purple" });
+	},
+	log: (msg: string) => console.log(`[心跳] ${msg}`),
+});
+
+// ── 每日对话蒸馏 ─────────────────────────────────
+
+const DISTILL_INTERVAL = 12 * 60 * 60 * 1000; // 12 小时检查一次
+const DISTILL_SCRIPT = resolve(import.meta.dirname, "distill-chats.ts");
+
+let distillTimer: ReturnType<typeof setTimeout> | null = null;
+let lastDistillCheck = 0;
+
+async function runDistillCycle(): Promise<void> {
+	const now = new Date();
+	const hour = now.getHours();
+	if (hour < 6 || hour > 23) return; // 深夜不执行
+
+	try {
+		console.log("[蒸馏] 开始每日对话蒸馏...");
+
+		// 1. 运行提取脚本
+		const proc = Bun.spawn(["bun", DISTILL_SCRIPT, "--workspace", defaultWorkspace, "--since", "26"], {
+			cwd: defaultWorkspace,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const stdout = await new Response(proc.stdout).text();
+		const exitCode = await proc.exited;
+
+		if (exitCode !== 0 || stdout.includes("无新对话") || stdout.includes("未找到")) {
+			console.log(`[蒸馏] ${stdout.trim().split("\n").pop() || "无新对话，跳过"}`);
+			return;
+		}
+
+		console.log(`[蒸馏] 提取完成: ${stdout.trim().split("\n").pop()}`);
+
+		// 2. 触发 Agent 蒸馏记忆
+		const extractPath = resolve(defaultWorkspace, ".cursor/memory/_chat-extract.md");
+		if (!existsSync(extractPath)) return;
+
+		const distillPrompt = [
+			"[记忆蒸馏] 请阅读 .cursor/memory/_chat-extract.md，这是从 Cursor 对话记录中自动提取的近期对话内容。",
+			"",
+			"请从中提炼以下信息，追加到 .cursor/MEMORY.md（如果文件不存在则创建）：",
+			"",
+			"1. **工作习惯** — 用户反复使用的工作方式、偏好的沟通风格、常用命令",
+			"2. **编码偏好** — 技术选型倾向、代码风格偏好、常用工具和模式",
+			"3. **重要决策** — 做出的关键技术/产品决策及其理由",
+			"4. **教训** — 出错后的调整、踩过的坑、需要记住的注意事项",
+			"5. **团队习惯** — 如果发现编码规范、提交规范等团队约定，同步更新 文档/团队习惯.md",
+			"",
+			"写入格式要求：",
+			"- 用 ### 标题分类，每条带日期标签",
+			"- 只写有价值的新发现，不重复已有记忆",
+			"- 保持精炼，每条 1-3 句话",
+			"- 写完后在 .cursor/memory/ 今天的日记中记录本次蒸馏摘要",
+			"",
+			"如果对话内容太少或没有有价值的信息，直接回复 DISTILL_SKIP。",
+		].join("\n");
+
+		memory?.appendSessionLog(defaultWorkspace, "user", "[记忆蒸馏] 自动提取对话记忆", config.CURSOR_MODEL);
+		const { result } = await runAgent(defaultWorkspace, distillPrompt, {
+			sessionKey: `${defaultWorkspace}::system:distill`,
+		});
+		memory?.appendSessionLog(defaultWorkspace, "assistant", result.slice(0, 3000), config.CURSOR_MODEL);
+
+		if (/DISTILL_SKIP/i.test(result)) {
+			console.log("[蒸馏] Agent 判断无有价值信息，跳过");
+		} else {
+			console.log("[蒸馏] 记忆蒸馏完成 ✓");
+			// 蒸馏成功后清理提取文件
+			try { unlinkSync(extractPath); } catch {}
+		}
+	} catch (err) {
+		console.warn(`[蒸馏] 错误: ${err instanceof Error ? err.message : err}`);
+	}
+}
+
+function scheduleDistill(): void {
+	if (distillTimer) clearTimeout(distillTimer);
+	distillTimer = setTimeout(async () => {
+		distillTimer = null;
+		lastDistillCheck = Date.now();
+		await runDistillCycle();
+		scheduleDistill();
+	}, lastDistillCheck ? DISTILL_INTERVAL : 5 * 60 * 1000); // 首次启动 5 分钟后执行
+	distillTimer.unref();
+}
+
+scheduleDistill();
+console.log(`[蒸馏] 已启动每日对话蒸馏（每 ${DISTILL_INTERVAL / 3600000}h 检查）`);
+
+// ── 飞书 Client ──────────────────────────────────
+const larkClient = new Lark.Client({
+	appId: config.FEISHU_APP_ID,
+	appSecret: config.FEISHU_APP_SECRET,
+	domain: Lark.Domain.Feishu,
+});
+
+// ── 卡片构建 ─────────────────────────────────────
+function buildCard(markdown: string, header?: { title?: string; color?: string }): string {
+	const card: Record<string, unknown> = {
+		schema: "2.0",
+		config: { wide_screen_mode: true },
+		body: { elements: [{ tag: "markdown", content: markdown }] },
+	};
+	if (header) {
+		const h: Record<string, unknown> = { template: header.color || "blue" };
+		if (header.title) h.title = { tag: "plain_text", content: header.title };
+		card.header = h;
+	}
+	return JSON.stringify(card);
+}
+
+// 从飞书 API 错误中提取可读原因
+function extractCardError(err: unknown): string | null {
+	try {
+		const e = err as Record<string, unknown>;
+		// axios 错误结构: err.response.data 或 err[1]（Lark SDK 包装）
+		const data = (e.response as Record<string, unknown>)?.data as Record<string, unknown>
+			?? (Array.isArray(e) ? e[1] : null)
+			?? e;
+		if (!data) return null;
+		const code = data.code as number;
+		const msg = data.msg as string;
+		if (code === 230099) return `卡片渲染失败: ${msg}`;
+		if (code === 230025) return "卡片内容超过30KB大小限制";
+		if (msg) return msg;
+	} catch {}
+	return null;
+}
+
+// ── 飞书消息操作 ─────────────────────────────────
+async function replyCard(
+	messageId: string,
+	markdown: string,
+	header?: { title?: string; color?: string },
+): Promise<string | undefined> {
+	try {
+		const res = await larkClient.im.message.reply({
+			path: { message_id: messageId },
+			data: { content: buildCard(markdown, header), msg_type: "interactive" },
+		});
+		const cardId = res.data?.message_id;
+		if (cardId) lastCardUpdateAt.set(cardId, Date.now());
+		return cardId;
+	} catch (err) {
+		console.error("[回复卡片失败]", err);
+		try {
+			const res = await larkClient.im.message.reply({
+				path: { message_id: messageId },
+				data: { content: JSON.stringify({ text: markdown }), msg_type: "text" },
+			});
+			return res.data?.message_id;
+		} catch {}
+	}
+}
+
+const CARD_UPDATE_MIN_INTERVAL = 10_000;
+const CARD_UPDATE_RETRY_DELAY = 10_000;
+const lastCardUpdateAt = new Map<string, number>();
+
+function waitFor(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isCardUpdateRateLimited(reason: string): boolean {
+	return /230020|frequency limit|too frequently/i.test(reason);
+}
+
+async function updateCard(
+	messageId: string,
+	markdown: string,
+	header?: { title?: string; color?: string },
+): Promise<{ ok: boolean; error?: string }> {
+	const elapsed = Date.now() - (lastCardUpdateAt.get(messageId) || 0);
+	if (elapsed < CARD_UPDATE_MIN_INTERVAL) {
+		await waitFor(CARD_UPDATE_MIN_INTERVAL - elapsed);
+	}
+
+	for (let attempt = 0; attempt < 2; attempt++) {
+		try {
+			await larkClient.im.message.patch({
+				path: { message_id: messageId },
+				data: { content: buildCard(markdown, header) },
+			});
+			lastCardUpdateAt.set(messageId, Date.now());
+			return { ok: true };
+		} catch (err) {
+			const reason = extractCardError(err) || (err instanceof Error ? err.message : String(err));
+			if (attempt === 0 && isCardUpdateRateLimited(reason)) {
+				console.warn(`[更新卡片限流] 等待 ${CARD_UPDATE_RETRY_DELAY / 1000}s 后重试`);
+				await waitFor(CARD_UPDATE_RETRY_DELAY);
+				continue;
+			}
+			console.error(`[更新卡片失败] ${reason}`);
+			return { ok: false, error: reason };
+		}
+	}
+	return { ok: false, error: "卡片更新重试次数耗尽" };
+}
+
+interface ActiveTaskRecord {
+	cardId: string;
+	messageId: string;
+	chatId: string;
+	prompt: string;
+	startedAt: number;
+}
+
+function readActiveTasks(): ActiveTaskRecord[] {
+	if (!existsSync(ACTIVE_TASKS_PATH)) return [];
+	try {
+		const value = JSON.parse(readUtf8Text(ACTIVE_TASKS_PATH));
+		return Array.isArray(value) ? value.filter((task): task is ActiveTaskRecord =>
+			!!task && typeof task.cardId === "string" && typeof task.messageId === "string",
+		) : [];
+	} catch (err) {
+		console.warn("[恢复] 读取遗留任务失败:", err);
+		return [];
+	}
+}
+
+function writeActiveTasks(tasks: ActiveTaskRecord[]): void {
+	mkdirSync(resolve(ROOT, "runtime"), { recursive: true });
+	writeFileSync(ACTIVE_TASKS_PATH, JSON.stringify(tasks, null, 2), "utf-8");
+}
+
+function rememberActiveTask(task: ActiveTaskRecord): void {
+	const tasks = readActiveTasks().filter((item) => item.cardId !== task.cardId);
+	tasks.push(task);
+	writeActiveTasks(tasks);
+}
+
+function forgetActiveTask(cardId: string | undefined): void {
+	if (!cardId) return;
+	const tasks = readActiveTasks();
+	const remaining = tasks.filter((task) => task.cardId !== cardId);
+	if (remaining.length !== tasks.length) writeActiveTasks(remaining);
+}
+
+async function recoverInterruptedTasks(): Promise<void> {
+	const tasks = readActiveTasks();
+	if (!tasks.length) return;
+
+	console.warn(`[恢复] 发现 ${tasks.length} 个服务重启前未完成的任务`);
+	for (const task of tasks) {
+		const { ok } = await updateCard(
+			task.cardId,
+			"服务刚刚重启，本次任务未能完成。请重新发送该问题；新的任务会正常继续执行。",
+			{ title: "任务已中断", color: "orange" },
+		);
+		if (!ok) {
+			console.warn(`[恢复] 无法更新遗留任务卡片: ${task.cardId}`);
+		}
+	}
+	// Each record belongs to the previous bridge process. Never leave an old card
+	// permanently in the executing state if its update failed transiently.
+	writeActiveTasks([]);
+}
+
+async function sendCard(
+	chatId: string,
+	markdown: string,
+	header?: { title?: string; color?: string },
+): Promise<string | undefined> {
+	try {
+		const res = await larkClient.im.message.create({
+			params: { receive_id_type: "chat_id" },
+			data: { receive_id: chatId, msg_type: "interactive", content: buildCard(markdown, header) },
+		});
+		return res.data?.message_id;
+	} catch (err) {
+		console.error("[发送卡片失败]", err);
+	}
+}
+
+// 长消息分片发送
+const CARD_MAX = 3800;
+async function replyLongMessage(messageId: string, chatId: string, text: string, header?: { title?: string; color?: string }): Promise<void> {
+	if (text.length <= CARD_MAX) {
+		await replyCard(messageId, text, header);
+		return;
+	}
+	const chunks: string[] = [];
+	let remaining = text;
+	while (remaining.length > 0) {
+		if (remaining.length <= CARD_MAX) {
+			chunks.push(remaining);
+			break;
+		}
+		let cut = remaining.lastIndexOf("\n", CARD_MAX);
+		if (cut < CARD_MAX * 0.5) cut = CARD_MAX;
+		chunks.push(remaining.slice(0, cut));
+		remaining = remaining.slice(cut);
+	}
+	for (let i = 0; i < chunks.length; i++) {
+		const h = chunks.length > 1 ? { title: `${header?.title || "回复"} (${i + 1}/${chunks.length})`, color: header?.color } : header;
+		if (i === 0) await replyCard(messageId, chunks[i], h);
+		else await sendCard(chatId, chunks[i], h);
+	}
+}
+
+// ── 媒体下载 ─────────────────────────────────────
+async function readResponseBuffer(response: unknown, depth = 0): Promise<Buffer> {
+	if (depth > 3) throw new Error("readResponseBuffer: 响应嵌套过深");
+	const resp = response as Record<string, unknown>;
+	if (resp instanceof Readable || typeof (resp as Readable).pipe === "function") {
+		const chunks: Buffer[] = [];
+		for await (const chunk of resp as Readable) {
+			chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array));
+		}
+		return Buffer.concat(chunks);
+	}
+	if (typeof resp.writeFile === "function") {
+		const tmp = resolve(INBOX_DIR, `.tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+		await (resp as { writeFile: (p: string) => Promise<void> }).writeFile(tmp);
+		const buf = readFileSync(tmp);
+		try { unlinkSync(tmp); } catch {}
+		return buf;
+	}
+	if (Buffer.isBuffer(resp)) return resp;
+	if (resp.data && resp.data !== resp) return readResponseBuffer(resp.data, depth + 1);
+	throw new Error("无法解析飞书资源响应");
+}
+
+async function downloadMedia(
+	messageId: string,
+	fileKey: string,
+	type: "image" | "file",
+	ext: string,
+): Promise<string> {
+	const response = await larkClient.im.messageResource.get({
+		path: { message_id: messageId, file_key: fileKey },
+		params: { type },
+	});
+	const buffer = await readResponseBuffer(response);
+	const filename = `${type}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`;
+	const filepath = resolve(INBOX_DIR, filename);
+	writeFileSync(filepath, buffer);
+	console.log(`[下载] ${filepath} (${buffer.length} bytes)`);
+	return filepath;
+}
+
+// ── 语音转文字（火山引擎 → 云端 API → 本地 whisper）──
+const WHISPER_MODEL = resolve(HOME, ".cache/whisper-cpp/ggml-tiny.bin");
+const WHISPER_BIN = process.env.WHISPER_CLI || "whisper-cli";
+const STT_DEBUG = /^(whisper_|ggml_|main:|system_info:|metal_|coreml_|log_)/;
+
+function convertToWav(audioPath: string): string {
+	const wavPath = audioPath.replace(/\.[^.]+$/, ".wav");
+	execFileSync("ffmpeg", ["-y", "-i", audioPath, "-ar", "16000", "-ac", "1", wavPath], {
+		timeout: 30_000,
+		stdio: "pipe",
+	});
+	return wavPath;
+}
+
+// 火山引擎豆包大模型 STT（WebSocket 二进制协议）
+// 协议文档: https://www.volcengine.com/docs/6561/1354869
+const VOLC_STT_URL = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream";
+const VOLC_RESOURCE_ID = "volc.bigasr.sauc.duration";
+
+function volcBuildHeader(msgType: number, flags: number, serial: number, compress: number): Buffer {
+	const h = Buffer.alloc(4);
+	h[0] = 0x11; // protocol v1, header_size = 4 bytes (1×4)
+	h[1] = ((msgType & 0xF) << 4) | (flags & 0xF);
+	h[2] = ((serial & 0xF) << 4) | (compress & 0xF);
+	h[3] = 0x00;
+	return h;
+}
+
+function volcBuildPacket(header: Buffer, payload: Buffer): Buffer {
+	const size = Buffer.alloc(4);
+	size.writeUInt32BE(payload.length);
+	return Buffer.concat([header, size, payload]);
+}
+
+function transcribeVolcengine(wavPath: string): Promise<string> {
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		const connectId = randomUUID();
+
+		const ws = new WebSocket(VOLC_STT_URL, {
+			headers: {
+				"X-Api-App-Key": config.VOLC_STT_APP_ID,
+				"X-Api-Access-Key": config.VOLC_STT_ACCESS_TOKEN,
+				"X-Api-Resource-Id": VOLC_RESOURCE_ID,
+				"X-Api-Connect-Id": connectId,
+			},
+		});
+
+		const timer = setTimeout(() => done(new Error("超时 (30s)")), 30_000);
+
+		function done(err: Error | null, text?: string) {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			try { ws.close(); } catch {}
+			if (err) reject(err);
+			else resolve(text!);
+		}
+
+		ws.on("open", () => {
+			// 1) full_client_request: JSON + gzip
+			const configPayload = Buffer.from(JSON.stringify({
+				user: { uid: "relay-bot" },
+				audio: { format: "pcm", rate: 16000, bits: 16, channel: 1 },
+				request: { model_name: "bigmodel", enable_itn: true, enable_punc: true, enable_ddc: true },
+			}));
+			const hdr = volcBuildHeader(0x1, 0x0, 0x1, 0x1);
+			ws.send(volcBuildPacket(hdr, gzipSync(configPayload)));
+
+			// 2) audio_only_request: 读 WAV 文件并分包发送 PCM 数据
+			const wav = readFileSync(wavPath);
+			let pcmOffset = 44;
+			for (let i = 12; i + 8 < wav.length;) {
+				if (wav.subarray(i, i + 4).toString("ascii") === "data") {
+					pcmOffset = i + 8;
+					break;
+				}
+				i += 8 + wav.readUInt32LE(i + 4);
+			}
+			const pcm = wav.subarray(pcmOffset);
+			const CHUNK = 6400; // 200ms @ 16kHz 16-bit mono
+
+			for (let off = 0; off < pcm.length; off += CHUNK) {
+				const isLast = off + CHUNK >= pcm.length;
+				const chunk = pcm.subarray(off, Math.min(off + CHUNK, pcm.length));
+				// flags: 0x2 = last packet, 0x0 = normal; serial: raw(0), compress: gzip(1)
+				const aHdr = volcBuildHeader(0x2, isLast ? 0x2 : 0x0, 0x0, 0x1);
+				ws.send(volcBuildPacket(aHdr, gzipSync(chunk)));
+			}
+		});
+
+		ws.on("message", (raw: Buffer | ArrayBuffer | Buffer[]) => {
+			const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as ArrayBuffer);
+			if (buf.length < 4) return;
+
+			const msgType = (buf[1] >> 4) & 0xF;
+			const flags = buf[1] & 0xF;
+			const compress = buf[2] & 0xF;
+
+			// 错误响应
+			if (msgType === 0xF) {
+				let msg = "服务端错误";
+				if (buf.length >= 12) {
+					const code = buf.readUInt32BE(4);
+					const msgLen = buf.readUInt32BE(8);
+					msg = `[${code}] ${buf.subarray(12, 12 + Math.min(msgLen, buf.length - 12)).toString("utf-8")}`;
+				}
+				done(new Error(msg));
+				return;
+			}
+
+			// 等待最终识别结果（flags bit 1 = 最后一包响应）
+			if (msgType === 0x9 && (flags & 0x2)) {
+				let off = 4;
+				if (flags & 0x1) off += 4; // 跳过 sequence number
+				if (off + 4 > buf.length) return;
+				const pSize = buf.readUInt32BE(off);
+				off += 4;
+				if (off + pSize > buf.length) return;
+
+				let payload = buf.subarray(off, off + pSize);
+				if (compress === 1) {
+					try { payload = gunzipSync(payload); } catch { done(new Error("解压响应失败")); return; }
+				}
+				try {
+					const json = JSON.parse(payload.toString("utf-8"));
+					const text = json?.result?.text?.trim();
+					if (text) done(null, text);
+					else done(new Error("识别结果为空"));
+				} catch {
+					done(new Error("解析响应 JSON 失败"));
+				}
+			}
+		});
+
+		ws.on("unexpected-response", (_req: unknown, res: { statusCode?: number }) => {
+			done(new Error(`HTTP ${res.statusCode ?? "unknown"} (WebSocket 升级被拒)`));
+		});
+		ws.on("error", (err: Error) => done(new Error(`WebSocket: ${err.message}`)));
+		ws.on("close", () => { if (!settled) done(new Error("连接意外断开")); });
+	});
+}
+
+function transcribeLocal(wavPath: string): string | null {
+	if (!existsSync(WHISPER_MODEL)) return null;
+	try {
+		const result = execFileSync(
+			WHISPER_BIN,
+			["--model", WHISPER_MODEL, "--language", "zh", "--no-timestamps", wavPath],
+			{ timeout: 120_000, encoding: "utf-8", stdio: "pipe" },
+		);
+		const transcript = result
+			.split("\n")
+			.filter((l: string) => !STT_DEBUG.test(l) && l.trim())
+			.join(" ")
+			.trim();
+		return transcript || null;
+	} catch (err) {
+		console.error("[STT 本地失败]", err instanceof Error ? err.message : err);
+		return null;
+	}
+}
+
+async function transcribeAudio(audioPath: string): Promise<string | null> {
+	let wavPath: string | undefined;
+	try {
+		wavPath = convertToWav(audioPath);
+
+		// 火山引擎豆包大模型（含重试）→ 本地 whisper 兜底
+		if (config.VOLC_STT_APP_ID && config.VOLC_STT_ACCESS_TOKEN) {
+			const maxRetries = 3;
+			for (let attempt = 1; attempt <= maxRetries; attempt++) {
+				try {
+					const text = await transcribeVolcengine(wavPath);
+					console.log(`[STT 火山引擎] 成功 (${text.length} chars, 第${attempt}次)`);
+					return text;
+				} catch (err) {
+					const msg = err instanceof Error ? err.message : String(err);
+					console.warn(`[STT 火山引擎] 第${attempt}/${maxRetries}次失败: ${msg}`);
+					if (attempt < maxRetries) {
+						console.log(`[STT 火山引擎] 500ms 后重试...`);
+						await new Promise((r) => setTimeout(r, 500));
+					}
+				}
+			}
+			console.warn("[STT 火山引擎] 重试耗尽，降级本地 whisper");
+		}
+
+		const local = transcribeLocal(wavPath);
+		if (local) console.log(`[STT 本地] 成功 (${local.length} chars)`);
+		else console.warn("[STT] 所有引擎均不可用");
+		return local;
+	} catch (err) {
+		console.error("[STT 转码失败]", err instanceof Error ? err.message : err);
+		return null;
+	} finally {
+		if (wavPath) try { unlinkSync(wavPath); } catch {}
+	}
+}
+
+// ── 消息解析 ─────────────────────────────────────
+interface ParsedMessageContent {
+	text: string;
+	imageKey?: string;
+	imageKeys?: string[];
+	fileKey?: string;
+	fileName?: string;
+}
+
+function parsePostContent(payload: unknown): Pick<ParsedMessageContent, "text" | "imageKey" | "imageKeys"> {
+	const texts: string[] = [];
+	const imageKeys: string[] = [];
+
+	function addText(value: unknown) {
+		if (typeof value !== "string") return;
+		const trimmed = value.trim();
+		if (trimmed && !texts.includes(trimmed)) texts.push(trimmed);
+	}
+
+	function addImageKey(value: unknown) {
+		if (typeof value !== "string") return;
+		const trimmed = value.trim();
+		if (trimmed && !imageKeys.includes(trimmed)) imageKeys.push(trimmed);
+	}
+
+	function visit(value: unknown): void {
+		if (Array.isArray(value)) {
+			for (const item of value) visit(item);
+			return;
+		}
+		if (!value || typeof value !== "object") return;
+
+		const item = value as Record<string, unknown>;
+		addText(item.title);
+		addText(item.text);
+		addImageKey(item.image_key);
+
+		for (const [key, child] of Object.entries(item)) {
+			if (key !== "title" && key !== "text" && key !== "image_key") visit(child);
+		}
+	}
+
+	visit(payload);
+	return {
+		text: texts.join("\n"),
+		imageKey: imageKeys[0],
+		imageKeys: imageKeys.length ? imageKeys : undefined,
+	};
+}
+
+function parseContent(
+	messageType: string,
+	content: string,
+): ParsedMessageContent {
+	try {
+		const p = JSON.parse(content);
+		switch (messageType) {
+			case "text":
+				return { text: p.text || "" };
+			case "image":
+				return { text: "", imageKey: p.image_key, imageKeys: p.image_key ? [p.image_key] : undefined };
+			case "audio":
+				return { text: "", fileKey: p.file_key };
+			case "file":
+				return { text: "", fileKey: p.file_key, fileName: p.file_name };
+			case "post":
+				return parsePostContent(p);
+			default:
+				return { text: `[不支持: ${messageType}]` };
+		}
+	} catch {
+		return { text: content };
+	}
+}
+
+interface FeishuMessageItem {
+	message_id?: string;
+	chat_id?: string;
+	msg_type?: string;
+	body?: { content?: string };
+	sender?: {
+		id?: string;
+		id_type?: string;
+		sender_type?: string;
+		sender_name?: string;
+	};
+	create_time?: string;
+	upper_message_id?: string;
+}
+
+interface MergeForwardExtract {
+	text: string;
+	attachments: Array<{ messageId: string; type: "image" | "file"; fileKey: string; fileName?: string }>;
+}
+
+function formatFeishuTime(value?: string): string {
+	const ms = Number.parseInt(String(value || ""), 10);
+	if (!Number.isFinite(ms) || ms <= 0) return "";
+	return new Date(ms).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
+}
+
+function senderLabel(item: FeishuMessageItem): string {
+	return item.sender?.sender_name || item.sender?.id || "unknown";
+}
+
+function parseForwardedItem(item: FeishuMessageItem): { line: string; attachment?: MergeForwardExtract["attachments"][number] } {
+	const msgType = item.msg_type || "unknown";
+	const messageId = item.message_id || "";
+	const parsed: ParsedMessageContent = parseContent(msgType, item.body?.content || "{}");
+	const prefix = [
+		formatFeishuTime(item.create_time),
+		senderLabel(item),
+	].filter(Boolean).join(" ");
+
+	switch (msgType) {
+		case "text":
+		case "post":
+			return { line: `[${prefix}] ${parsed.text || "(空文本)"}` };
+		case "image":
+			if (messageId && parsed.imageKey) {
+				return {
+					line: `[${prefix}] [图片附件待下载: ${parsed.imageKey}]`,
+					attachment: { messageId, type: "image", fileKey: parsed.imageKey },
+				};
+			}
+			return { line: `[${prefix}] [图片消息]` };
+		case "file": {
+			const name = parsed.fileName || "未命名文件";
+			if (messageId && parsed.fileKey) {
+				return {
+					line: `[${prefix}] [文件附件待下载: ${name}]`,
+					attachment: { messageId, type: "file", fileKey: parsed.fileKey, fileName: name },
+				};
+			}
+			return { line: `[${prefix}] [文件消息: ${name}]` };
+		}
+		case "audio":
+			if (messageId && parsed.fileKey) {
+				return {
+					line: `[${prefix}] [语音附件待下载: ${parsed.fileKey}]`,
+					attachment: { messageId, type: "file", fileKey: parsed.fileKey, fileName: "forwarded-audio.ogg" },
+				};
+			}
+			return { line: `[${prefix}] [语音消息]` };
+		case "merge_forward":
+			return { line: `[${prefix}] [嵌套合并转发消息]` };
+		default:
+			return { line: `[${prefix}] [${msgType}] ${parsed.text || item.body?.content || ""}`.trim() };
+	}
+}
+
+async function fetchMergeForwardItems(messageId: string): Promise<FeishuMessageItem[]> {
+	const response = await larkClient.im.message.get({
+		path: { message_id: messageId },
+	}) as {
+		code?: number;
+		msg?: string;
+		data?: { items?: FeishuMessageItem[] };
+	};
+
+	if (response.code !== 0) {
+		throw new Error(`获取合并转发子消息失败: ${response.msg || response.code}`);
+	}
+	return response.data?.items || [];
+}
+
+async function expandMergeForwardMessage(messageId: string): Promise<string> {
+	const items = await fetchMergeForwardItems(messageId);
+	const children = items.filter((item) => item.message_id !== messageId);
+	const capped = children.slice(0, 50);
+	const lines: string[] = [`用户转发了一组合并消息，共 ${children.length} 条。`];
+	const attachments: MergeForwardExtract["attachments"] = [];
+
+	for (let i = 0; i < capped.length; i++) {
+		const item = capped[i];
+		const parsed = parseForwardedItem(item);
+		lines.push(`${i + 1}. ${parsed.line}`);
+		if (parsed.attachment) attachments.push(parsed.attachment);
+	}
+
+	for (const attachment of attachments.slice(0, 10)) {
+		try {
+			const ext = attachment.type === "image"
+				? ".png"
+				: extname(attachment.fileName || "") || "";
+			const path = await downloadMedia(attachment.messageId, attachment.fileKey, attachment.type, ext);
+			const label = attachment.type === "image" ? "图片" : `文件 ${attachment.fileName || ""}`.trim();
+			lines.push(`[已下载合并转发附件: ${label} -> ${path}]`);
+		} catch (err) {
+			lines.push(`[合并转发附件下载失败: ${attachment.fileName || attachment.fileKey}，${err instanceof Error ? err.message : err}]`);
+		}
+	}
+
+	if (children.length > capped.length) {
+		lines.push(`... 其余 ${children.length - capped.length} 条未展开。`);
+	}
+	if (attachments.length > 10) {
+		lines.push(`... 其余 ${attachments.length - 10} 个附件未下载。`);
+	}
+
+	return lines.join("\n");
+}
+
+// ── ANSI 清理 ────────────────────────────────────
+function strip(s: string): string {
+	return s
+		.replace(/\x1b\][^\x07]*\x07/g, "")
+		.replace(/\x1b\][^\x1b]*\x1b\\/g, "")
+		.replace(/\x1b\[\?[0-9;]*[a-zA-Z]/g, "")
+		.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "")
+		.replace(/\x1b[=>MNOZ78]/g, "")
+		.replace(/\r/g, "")
+		.trim();
+}
+
+function bufferToString(value: unknown): string {
+	if (!value) return "";
+	if (Buffer.isBuffer(value)) return value.toString("utf-8");
+	return String(value);
+}
+
+function redactSecretText(text: string): string {
+	return text
+		.replace(/gh[pousr]_[A-Za-z0-9_]+/g, "<redacted-token>")
+		.replace(/github_pat_[A-Za-z0-9_]+/g, "<redacted-token>")
+		.replace(/(https?:\/\/)([^\/\s:@]+):?([^\/\s@]*)@/g, "$1<redacted>@")
+		.replace(/\b((?:token|password|passwd|secret|key)=)[^\s]+/gi, "$1<redacted>");
+}
+
+function safeExecText(command: string, args: string[], cwd?: string): { ok: boolean; text: string } {
+	try {
+		const out = execFileSync(command, args, {
+			cwd,
+			encoding: "utf-8",
+			timeout: 8000,
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		return { ok: true, text: redactSecretText(strip(out)) };
+	} catch (err) {
+		const e = err as { stdout?: unknown; stderr?: unknown; message?: string };
+		const text = strip(`${bufferToString(e.stdout)}\n${bufferToString(e.stderr)}`) || e.message || "";
+		return { ok: false, text: redactSecretText(text) };
+	}
+}
+
+function envPresenceLine(name: string): string {
+	const value = process.env[name];
+	return value ? `- \`${name}\`: 已设置（长度 ${value.length}）` : `- \`${name}\`: 未设置`;
+}
+
+function buildGitAuthDiagnostics(workspace: string): string {
+	const envNames = [
+		"GH_TOKEN", "GITHUB_TOKEN", "GIT_ASKPASS", "SSH_AUTH_SOCK",
+		"GITLAB_TOKEN", "GITEA_TOKEN", "HTTP_PROXY", "HTTPS_PROXY",
+	];
+
+	const globalHelper = safeExecText("git", ["config", "--global", "--get", "credential.helper"], workspace);
+	const systemHelper = safeExecText("git", ["config", "--system", "--get", "credential.helper"], workspace);
+	const credentialConfig = safeExecText("git", ["config", "--show-origin", "--get-regexp", "credential\\.|url\\..*insteadOf|http\\..*proxy"], workspace);
+	const repoCheck = safeExecText("git", ["-C", workspace, "rev-parse", "--is-inside-work-tree"], workspace);
+	const remotes = repoCheck.ok && repoCheck.text === "true"
+		? safeExecText("git", ["-C", workspace, "remote", "-v"], workspace).text
+		: "当前工作区不是 git 仓库，未读取 remote。";
+	const ghStatus = safeExecText("gh", ["auth", "status"], workspace);
+	const sshStatus = process.env.SSH_AUTH_SOCK
+		? safeExecText("ssh-add", ["-l"], workspace).text
+		: "SSH_AUTH_SOCK 未设置，后台进程看不到 SSH agent。";
+
+	const helperLines = [
+		`- global: ${globalHelper.text || "(未配置)"}`,
+		`- system: ${systemHelper.text || "(未配置)"}`,
+	];
+
+	const hints: string[] = [];
+	if (!process.env.GH_TOKEN && !process.env.GITHUB_TOKEN && !/Logged in|已登录/i.test(ghStatus.text)) {
+		hints.push("- 当前后台没有 GitHub token，`gh` 也未登录；涉及私有 GitHub 仓库时应优先使用已有 Git Credential Manager 凭据，失败后再提示你。");
+	}
+	if (!process.env.SSH_AUTH_SOCK) {
+		hints.push("- 后台看不到 SSH agent；SSH 私库可能需要先在电脑上做一次长期配置。");
+	}
+	if (hints.length === 0) hints.push("- 未发现明显缺失项；如果某个仓库仍失败，应继续看该仓库 remote 和具体 stderr。");
+
+	return [
+		"**Git 认证自检**",
+		"",
+		"**环境变量（只显示是否存在，不显示值）：**",
+		...envNames.map(envPresenceLine),
+		"",
+		"**Git Credential Helper：**",
+		...helperLines,
+		"",
+		"**Git 认证相关配置：**",
+		credentialConfig.text ? `\`\`\`\n${credentialConfig.text.slice(0, 1200)}\n\`\`\`` : "（未发现额外配置）",
+		"",
+		"**gh auth status：**",
+		`\`\`\n${(ghStatus.text || "gh 不可用或未登录").slice(0, 1200)}\n\`\`\``,
+		"",
+		"**SSH agent：**",
+		`\`\`\n${sshStatus.slice(0, 800)}\n\`\`\``,
+		"",
+		"**当前仓库 remote：**",
+		`\`\`\n${remotes.slice(0, 1000)}\n\`\`\``,
+		"",
+		"**判断：**",
+		...hints,
+	].join("\n");
+}
+
+// ── 项目路由 ─────────────────────────────────────
+function route(text: string): { workspace: string; prompt: string; label: string } {
+	const { projects, default_project } = projectsConfig;
+	const m = text.match(/^(\S+?)[:\uff1a]\s*(.+)/s);
+	if (m && projects[m[1].toLowerCase()]) {
+		return {
+			workspace: projects[m[1].toLowerCase()].path,
+			prompt: m[2].trim(),
+			label: m[1].toLowerCase(),
+		};
+	}
+	return {
+		workspace: projects[default_project]?.path || ROOT,
+		prompt: text.trim(),
+		label: default_project,
+	};
+}
+
+// ── 可选模型列表 ─────────────────────────────────
+const CURSOR_MODELS = [
+	{ id: "opus-4.6-thinking", label: "Opus 4.6", desc: "最强深度推理" },
+	{ id: "opus-4.5-thinking", label: "Opus 4.5", desc: "强力推理" },
+	{ id: "gpt-5.3-codex", label: "GPT-5.3 Codex", desc: "OpenAI 编码旗舰" },
+	{ id: "gemini-3.1-pro", label: "Gemini 3.1 Pro", desc: "Google 最新旗舰" },
+	{ id: "gemini-3-pro", label: "Gemini 3 Pro", desc: "Google 旗舰" },
+	{ id: "gemini-3-flash", label: "Gemini 3 Flash", desc: "Google 极速" },
+	{ id: "auto", label: "Auto", desc: "自动选择最优" },
+];
+
+function fuzzyMatchModel(input: string): { exact?: typeof CURSOR_MODELS[number]; candidates: typeof CURSOR_MODELS } {
+	const q = input.toLowerCase().replace(/[\s_-]+/g, "");
+
+	// 精确匹配 id
+	const exact = CURSOR_MODELS.find((m) => m.id === input.toLowerCase());
+	if (exact) return { exact, candidates: [] };
+
+	// 编号匹配
+	const num = Number.parseInt(input, 10);
+	if (!Number.isNaN(num) && num >= 1 && num <= CURSOR_MODELS.length) {
+		return { exact: CURSOR_MODELS[num - 1], candidates: [] };
+	}
+
+	// 模糊：id 或 label 包含输入
+	const candidates = CURSOR_MODELS.filter((m) => {
+		const mid = m.id.replace(/[\s_-]+/g, "");
+		const mlab = m.label.toLowerCase().replace(/[\s_-]+/g, "");
+		return mid.includes(q) || mlab.includes(q) || q.includes(mid);
+	});
+
+	if (candidates.length === 1) return { exact: candidates[0], candidates: [] };
+	return { candidates };
+}
+
+function buildModelListCard(currentModel: string, errorHint?: string): string {
+	const lines: string[] = [];
+	if (errorHint) lines.push(`${errorHint}\n`);
+	for (let i = 0; i < CURSOR_MODELS.length; i++) {
+		const m = CURSOR_MODELS[i];
+		const isCurrent = m.id === currentModel;
+		lines.push(isCurrent
+			? `**${i + 1}. ${m.id}** · ${m.desc} ✅`
+			: `${i + 1}. \`${m.id}\` · ${m.desc}`);
+	}
+	lines.push("");
+	lines.push("> 发送 `/模型 编号` 或 `/模型 名称` 切换");
+	return lines.join("\n");
+}
+
+// ── 模型自动降级 ─────────────────────────────────
+// 每次请求都先试首选模型，失败再用 auto 重试
+const BILLING_PATTERNS = [
+	/unpaid invoice/i,
+	/pay your invoice/i,
+	/resume requests/i,
+	/billing/i,
+	/insufficient.*(balance|credit|fund|quota)/i,
+	/exceeded.*limit/i,
+	/payment.*required/i,
+	/out of credits/i,
+	/usage.*limit.*exceeded/i,
+	/subscription.*expired/i,
+	/plan.*expired/i,
+	/402/,
+	/费用不足/,
+	/余额不足/,
+	/额度/,
+];
+
+function isBillingError(text: string): boolean {
+	return BILLING_PATTERNS.some((p) => p.test(text));
+}
+
+function isCancellationError(text: string): boolean {
+	return /任务已被用户中止|user aborted|aborted|cancelled|canceled|terminated/i.test(text);
+}
+
+const childPids = new Set<number>();
+
+function killProcessTree(pid: number): void {
+	if (!pid) return;
+	try {
+		if (process.platform === "win32") {
+			execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
+			return;
+		}
+		process.kill(pid, "SIGTERM");
+	} catch {
+		try { process.kill(pid, "SIGTERM"); } catch {}
+	}
+}
+
+interface ActiveAgent {
+	pid: number;
+	workspace: string;
+	lockKey: string;
+	startedAt: number;
+	kill: () => void;
+}
+
+// lockKey → 正在运行的 agent 子进程（用于 /stop 终止）
+const activeAgents = new Map<string, ActiveAgent>();
+
+process.on("SIGTERM", () => {
+	for (const pid of childPids) {
+		killProcessTree(pid);
+	}
+	process.exit(0);
+});
+
+// ── Agent 执行引擎（直接 spawn CLI + stream-json）──
+// Feishu limits how often one message can be patched. Progress only needs to
+// reassure the user that the agent is moving, not mirror every CLI event.
+const PROGRESS_INTERVAL = 15_000;
+
+interface AgentProgress {
+	elapsed: number;
+	phase: "thinking" | "tool_call" | "responding";
+	snippet: string;
+}
+
+function formatElapsed(seconds: number): string {
+	if (seconds < 60) return `${seconds}秒`;
+	const mins = Math.floor(seconds / 60);
+	const secs = seconds % 60;
+	if (mins < 60) return secs > 0 ? `${mins}分${secs}秒` : `${mins}分`;
+	const hrs = Math.floor(mins / 60);
+	return `${hrs}时${mins % 60}分`;
+}
+
+// ── 时间格式化 ───────────────────────────────────
+function formatRelativeTime(ms: number): string {
+	const diff = Date.now() - ms;
+	if (diff < 60_000) return "刚刚";
+	if (diff < 3600_000) return `${Math.floor(diff / 60_000)}分钟前`;
+	if (diff < 86400_000) return `${Math.floor(diff / 3600_000)}小时前`;
+	if (diff < 604800_000) return `${Math.floor(diff / 86400_000)}天前`;
+	return new Date(ms).toLocaleDateString("zh-CN");
+}
+
+// ── 会话管理（支持历史列表 + 切换）─────────────────
+const SESSIONS_PATH = resolve(import.meta.dirname, ".sessions.json");
+const TOPICS_PATH = resolve(import.meta.dirname, ".topics.json");
+const MAX_SESSION_HISTORY = 20;
+const DEFAULT_TOPIC_ID = "default";
+const DEFAULT_TOPIC_NAME = "默认话题";
+
+interface SessionEntry {
+	id: string;
+	createdAt: number;
+	lastActiveAt: number;
+	summary: string;
+}
+
+interface WorkspaceSessions {
+	active: string | null;
+	history: SessionEntry[];
+}
+
+const sessionsStore: Map<string, WorkspaceSessions> = new Map();
+
+interface TopicEntry {
+	id: string;
+	name: string;
+	createdAt: number;
+	lastActiveAt: number;
+	sessionKey: string;
+}
+
+interface WorkspaceTopics {
+	active: string;
+	topics: TopicEntry[];
+}
+
+const topicsStore: Map<string, WorkspaceTopics> = new Map();
+
+function loadSessionsFromDisk(): void {
+	try {
+		if (!existsSync(SESSIONS_PATH)) return;
+		const raw = JSON.parse(readUtf8Text(SESSIONS_PATH));
+		sessionsStore.clear();
+		for (const [k, v] of Object.entries(raw)) {
+			if (typeof v === "string") {
+				sessionsStore.set(k, {
+					active: v,
+					history: [{ id: v, createdAt: Date.now(), lastActiveAt: Date.now(), summary: "(旧会话)" }],
+				});
+			} else {
+				sessionsStore.set(k, v as WorkspaceSessions);
+			}
+		}
+		console.log(`[Session] 从磁盘恢复 ${sessionsStore.size} 个工作区会话`);
+	} catch {}
+}
+
+let sessionsSaving = false;
+
+function saveSessions(): void {
+	try {
+		sessionsSaving = true;
+		writeFileSync(SESSIONS_PATH, JSON.stringify(Object.fromEntries(sessionsStore), null, 2));
+	} catch {} finally {
+		setTimeout(() => { sessionsSaving = false; }, 500);
+	}
+}
+
+loadSessionsFromDisk();
+
+watchFile(SESSIONS_PATH, { interval: 3000 }, () => {
+	if (sessionsSaving) return;
+	try {
+		loadSessionsFromDisk();
+	} catch {}
+});
+
+function loadTopicsFromDisk(): void {
+	try {
+		if (!existsSync(TOPICS_PATH)) return;
+		const raw = JSON.parse(readUtf8Text(TOPICS_PATH));
+		topicsStore.clear();
+		for (const [k, v] of Object.entries(raw)) {
+			const scope = v as WorkspaceTopics;
+			if (!scope || !Array.isArray(scope.topics)) continue;
+			topicsStore.set(k, {
+				active: scope.active || DEFAULT_TOPIC_ID,
+				topics: scope.topics,
+			});
+		}
+		console.log(`[Topic] 从磁盘恢复 ${topicsStore.size} 个话题作用域`);
+	} catch {}
+}
+
+let topicsSaving = false;
+
+function saveTopics(): void {
+	try {
+		topicsSaving = true;
+		writeFileSync(TOPICS_PATH, JSON.stringify(Object.fromEntries(topicsStore), null, 2));
+	} catch {} finally {
+		setTimeout(() => { topicsSaving = false; }, 500);
+	}
+}
+
+loadTopicsFromDisk();
+
+watchFile(TOPICS_PATH, { interval: 3000 }, () => {
+	if (topicsSaving) return;
+	try {
+		loadTopicsFromDisk();
+	} catch {}
+});
+
+function topicScopeKey(chatId: string, workspace: string): string {
+	return `${chatId}\n${workspace}`;
+}
+
+function buildTopicSessionKey(chatId: string, workspace: string, topicId: string): string {
+	if (topicId === DEFAULT_TOPIC_ID) return workspace;
+	return `${workspace}::chat:${chatId}::topic:${topicId}`;
+}
+
+function normalizeTopicName(input: string): string {
+	return input
+		.replace(/^["'`“”‘’]+|["'`“”‘’]+$/g, "")
+		.replace(/\s+/g, " ")
+		.trim()
+		.slice(0, 50);
+}
+
+function projectLabelForWorkspace(workspace: string): string {
+	const realWorkspace = workspace.split("::chat:")[0];
+	return Object.entries(projectsConfig.projects).find(([, v]) => v.path === realWorkspace)?.[0] || realWorkspace;
+}
+
+function topicDisplayName(topic: TopicEntry): string {
+	return topic.id === DEFAULT_TOPIC_ID ? DEFAULT_TOPIC_NAME : topic.name;
+}
+
+function ensureTopicScope(chatId: string, workspace: string): WorkspaceTopics {
+	const key = topicScopeKey(chatId, workspace);
+	let scope = topicsStore.get(key);
+	const now = Date.now();
+	const defaultTopic: TopicEntry = {
+		id: DEFAULT_TOPIC_ID,
+		name: DEFAULT_TOPIC_NAME,
+		createdAt: now,
+		lastActiveAt: now,
+		sessionKey: buildTopicSessionKey(chatId, workspace, DEFAULT_TOPIC_ID),
+	};
+
+	if (!scope) {
+		scope = { active: DEFAULT_TOPIC_ID, topics: [defaultTopic] };
+		topicsStore.set(key, scope);
+		saveTopics();
+		return scope;
+	}
+
+	const existingDefault = scope.topics.find((t) => t.id === DEFAULT_TOPIC_ID);
+	if (!existingDefault) {
+		scope.topics.unshift(defaultTopic);
+		saveTopics();
+	} else {
+		existingDefault.name = DEFAULT_TOPIC_NAME;
+		existingDefault.sessionKey = defaultTopic.sessionKey;
+	}
+	if (!scope.topics.some((t) => t.id === scope.active)) scope.active = DEFAULT_TOPIC_ID;
+	return scope;
+}
+
+function getTopicHistory(chatId: string, workspace: string): TopicEntry[] {
+	const scope = ensureTopicScope(chatId, workspace);
+	return [...scope.topics].sort((a, b) => b.lastActiveAt - a.lastActiveAt);
+}
+
+function getActiveTopic(chatId: string, workspace: string): TopicEntry {
+	const scope = ensureTopicScope(chatId, workspace);
+	let topic = scope.topics.find((t) => t.id === scope.active);
+	if (!topic) {
+		scope.active = DEFAULT_TOPIC_ID;
+		topic = scope.topics.find((t) => t.id === DEFAULT_TOPIC_ID)!;
+		saveTopics();
+	}
+	topic.lastActiveAt = Date.now();
+	saveTopics();
+	return topic;
+}
+
+function findTopic(chatId: string, workspace: string, selector: string): TopicEntry | undefined {
+	const query = normalizeTopicName(selector);
+	if (!query || /^(默认|default)$/i.test(query)) {
+		return ensureTopicScope(chatId, workspace).topics.find((t) => t.id === DEFAULT_TOPIC_ID);
+	}
+
+	const history = getTopicHistory(chatId, workspace);
+	const num = Number.parseInt(query, 10);
+	if (!Number.isNaN(num) && num >= 1 && num <= history.length) return history[num - 1];
+
+	const lower = query.toLowerCase();
+	return history.find((t) => t.id === query || t.name.toLowerCase() === lower)
+		|| history.find((t) => t.name.toLowerCase().includes(lower));
+}
+
+function switchTopic(chatId: string, workspace: string, selector: string): TopicEntry | undefined {
+	const scope = ensureTopicScope(chatId, workspace);
+	const topic = findTopic(chatId, workspace, selector);
+	if (!topic) return undefined;
+	scope.active = topic.id;
+	topic.lastActiveAt = Date.now();
+	saveTopics();
+	return topic;
+}
+
+function createOrSwitchTopic(chatId: string, workspace: string, rawName: string): TopicEntry | undefined {
+	const name = normalizeTopicName(rawName);
+	if (!name) return undefined;
+	const scope = ensureTopicScope(chatId, workspace);
+	const existing = scope.topics.find((t) => t.name.toLowerCase() === name.toLowerCase());
+	if (existing) {
+		scope.active = existing.id;
+		existing.lastActiveAt = Date.now();
+		saveTopics();
+		return existing;
+	}
+
+	const id = randomUUID();
+	const topic: TopicEntry = {
+		id,
+		name,
+		createdAt: Date.now(),
+		lastActiveAt: Date.now(),
+		sessionKey: buildTopicSessionKey(chatId, workspace, id),
+	};
+	scope.topics.unshift(topic);
+	scope.active = topic.id;
+	saveTopics();
+	return topic;
+}
+
+function renameActiveTopic(chatId: string, workspace: string, rawName: string): TopicEntry | undefined {
+	const name = normalizeTopicName(rawName);
+	if (!name) return undefined;
+	const scope = ensureTopicScope(chatId, workspace);
+	const topic = scope.topics.find((t) => t.id === scope.active);
+	if (!topic || topic.id === DEFAULT_TOPIC_ID) return undefined;
+	topic.name = name;
+	topic.lastActiveAt = Date.now();
+	saveTopics();
+	return topic;
+}
+
+function deleteTopic(chatId: string, workspace: string, selector: string): TopicEntry | undefined {
+	const scope = ensureTopicScope(chatId, workspace);
+	const topic = findTopic(chatId, workspace, selector);
+	if (!topic || topic.id === DEFAULT_TOPIC_ID) return undefined;
+	scope.topics = scope.topics.filter((t) => t.id !== topic.id);
+	if (scope.active === topic.id) scope.active = DEFAULT_TOPIC_ID;
+	saveTopics();
+	return topic;
+}
+
+function describeSessionScope(sessionKey: string): string {
+	for (const scope of topicsStore.values()) {
+		const topic = scope.topics.find((t) => t.sessionKey === sessionKey);
+		if (topic) return `${projectLabelForWorkspace(sessionKey)}#${topicDisplayName(topic)}`;
+	}
+	return projectLabelForWorkspace(sessionKey);
+}
+
+function getActiveSessionId(workspace: string): string | undefined {
+	return sessionsStore.get(workspace)?.active || undefined;
+}
+
+function setActiveSession(workspace: string, sessionId: string, summary?: string): void {
+	let ws = sessionsStore.get(workspace);
+	if (!ws) {
+		ws = { active: null, history: [] };
+		sessionsStore.set(workspace, ws);
+	}
+
+	const existing = ws.history.find((h) => h.id === sessionId);
+	if (existing) {
+		existing.lastActiveAt = Date.now();
+		if (summary && existing.summary === "(新会话)") {
+			existing.summary = summary;
+		}
+	} else {
+		ws.history.unshift({
+			id: sessionId,
+			createdAt: Date.now(),
+			lastActiveAt: Date.now(),
+			summary: summary || "(新会话)",
+		});
+	}
+
+	if (ws.history.length > MAX_SESSION_HISTORY) {
+		ws.history = ws.history.slice(0, MAX_SESSION_HISTORY);
+	}
+
+	ws.active = sessionId;
+	saveSessions();
+}
+
+function updateSessionSummary(workspace: string, sessionId: string, summary: string): void {
+	const ws = sessionsStore.get(workspace);
+	if (!ws) return;
+	const entry = ws.history.find((h) => h.id === sessionId);
+	if (entry) {
+		entry.summary = summary;
+		saveSessions();
+	}
+}
+
+function generateSessionTitleFallback(prompt: string, result: string): string {
+	const noise = /^(帮我|请你?|麻烦|你好|嗨|hi|hello|hey|ok|好的|嗯|哦)[，,。.！!？?\s]*/gi;
+	const cleaned = prompt.replace(noise, "").trim();
+
+	if (cleaned.length >= 4 && cleaned.length <= 40) return cleaned;
+	if (cleaned.length > 40) {
+		const cutoff = cleaned.slice(0, 40);
+		const lastPunct = Math.max(
+			cutoff.lastIndexOf("，"), cutoff.lastIndexOf("。"),
+			cutoff.lastIndexOf("；"), cutoff.lastIndexOf(","),
+			cutoff.lastIndexOf(" "),
+		);
+		return (lastPunct > 15 ? cutoff.slice(0, lastPunct) : cutoff) + "…";
+	}
+	const firstLine = result.split("\n").find((l) => {
+		const t = l.replace(/^[#*>\-\s]+/, "").trim();
+		return t.length >= 4 && !t.startsWith("```") && !t.startsWith("HEARTBEAT");
+	});
+	if (firstLine) {
+		const t = firstLine.replace(/^[#*>\-\s]+/, "").replace(/\*\*/g, "").trim();
+		return t.length <= 40 ? t : t.slice(0, 38) + "…";
+	}
+	return cleaned || prompt.slice(0, 30) || "(对话)";
+}
+
+async function generateSessionTitle(workspace: string, sessionId: string, prompt: string, result: string): Promise<void> {
+	const fallback = generateSessionTitleFallback(prompt, result);
+	try {
+		const context = `用户: ${prompt.slice(0, 200)}\n\nAI回复摘要: ${result.slice(0, 500)}`;
+		const titlePrompt = `根据以下对话，生成一个简短的中文标题。要求：必须使用中文，4-20个字，不加标点，不加引号，不加书名号，直接输出标题，不要输出任何其它内容。\n\n${context}`;
+		const child = spawn(AGENT_BIN, [
+			"-p", "--force", "--trust",
+			"--model", "auto",
+			"--output-format", "text",
+			"--", titlePrompt,
+		], {
+			env: {
+				...process.env,
+				CURSOR_API_KEY: config.CURSOR_API_KEY,
+				CODEX_AGENT_TIMEOUT_MS: config.CODEX_AGENT_TIMEOUT_MS,
+			},
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+
+		const title = await new Promise<string>((resolve) => {
+			let out = "";
+			const timeout = setTimeout(() => { child.kill(); resolve(fallback); }, 15_000);
+			child.stdout!.on("data", (c: Buffer) => { out += c.toString(); });
+			child.on("close", () => {
+				clearTimeout(timeout);
+				const raw = out.trim().split("\n").pop()?.trim() || "";
+				const clean = raw.replace(/^["'「《]|["'」》]$/g, "").replace(/[。.！!？?]$/, "").trim();
+				resolve(clean.length >= 2 && clean.length <= 30 ? clean : fallback);
+			});
+			child.on("error", () => { clearTimeout(timeout); resolve(fallback); });
+		});
+
+		updateSessionSummary(workspace, sessionId, title);
+		console.log(`[Session] LLM 命名: ${title}`);
+	} catch {
+		updateSessionSummary(workspace, sessionId, fallback);
+		console.log(`[Session] 降级命名: ${fallback}`);
+	}
+}
+
+function archiveAndResetSession(workspace: string): void {
+	const ws = sessionsStore.get(workspace);
+	if (ws?.active) {
+		ws.active = null;
+		saveSessions();
+		console.log(`[Session ${workspace}] 已归档并重置`);
+	}
+}
+
+function switchToSession(workspace: string, sessionId: string): boolean {
+	const ws = sessionsStore.get(workspace);
+	if (!ws) return false;
+	const entry = ws.history.find((h) => h.id === sessionId);
+	if (!entry) return false;
+	ws.active = sessionId;
+	entry.lastActiveAt = Date.now();
+	saveSessions();
+	return true;
+}
+
+function getSessionHistory(workspace: string, limit = 10): SessionEntry[] {
+	const ws = sessionsStore.get(workspace);
+	if (!ws) return [];
+	return [...ws.history]
+		.sort((a, b) => b.lastActiveAt - a.lastActiveAt)
+		.slice(0, limit);
+}
+
+// 同一 session 的消息串行执行；不同 session（即使同工作区）可并行
+const sessionLocks = new Map<string, Promise<void>>();
+async function withSessionLock<T>(lockKey: string, fn: () => Promise<T>): Promise<T> {
+	const prev = sessionLocks.get(lockKey) || Promise.resolve();
+	let release!: () => void;
+	const next = new Promise<void>((r) => { release = r; });
+	sessionLocks.set(lockKey, next);
+	await prev;
+	try {
+		return await fn();
+	} finally {
+		release();
+	}
+}
+
+function getLockKey(sessionKey: string): string {
+	const sid = getActiveSessionId(sessionKey);
+	return sid ? `session:${sid}` : `ws:${sessionKey}`;
+}
+
+function findActiveAgents(workspace: string, sessionKey = workspace, all = false): ActiveAgent[] {
+	if (all) return [...activeAgents.values()];
+
+	const direct = activeAgents.get(getLockKey(sessionKey));
+	if (direct) return [direct];
+
+	const byWorkspace = [...activeAgents.values()].filter((agent) => agent.workspace === workspace);
+	if (byWorkspace.length > 0) return byWorkspace;
+
+	// If there is exactly one active task, treat it as the current task. This helps
+	// when the session id changed after the task started.
+	if (activeAgents.size === 1) return [...activeAgents.values()];
+
+	return [];
+}
+
+function stopActiveAgents(workspace: string, sessionKey = workspace, all = false): ActiveAgent[] {
+	const agents = findActiveAgents(workspace, sessionKey, all);
+	for (const agent of agents) {
+		console.log(`[指令] 终止 agent pid=${agent.pid} lock=${agent.lockKey}`);
+		agent.kill();
+	}
+	return agents;
+}
+
+// 解析一行 stream-json 输出
+interface StreamEvent {
+	type: string;
+	subtype?: string;
+	session_id?: string;
+	text?: string;
+	result?: string;
+	error?: string;
+	message?: { role: string; content: Array<{ type: string; text?: string }> };
+	tool_name?: string;
+	tool_call_id?: string;
+	call_id?: string;
+	tool_call?: Record<string, { args?: Record<string, unknown>; result?: Record<string, { content?: string }> }>;
+}
+
+function tryParseJson(line: string): StreamEvent | null {
+	const trimmed = line.trim();
+	if (!trimmed || !trimmed.startsWith("{")) return null;
+	try { return JSON.parse(trimmed); } catch { return null; }
+}
+
+const TOOL_LABELS: Record<string, string> = {
+	read: "📖 读取", write: "✏️ 写入", strReplace: "✏️ 编辑",
+	shell: "⚡ 执行", grep: "🔍 搜索", glob: "📂 查找",
+	semanticSearch: "🔎 语义搜索", webSearch: "🌐 搜索网页", webFetch: "🌐 抓取网页",
+	delete: "🗑️ 删除", editNotebook: "📓 编辑笔记本",
+	callMcpTool: "🔌 MCP工具", task: "🤖 子任务",
+};
+
+function describeToolCall(tc: Record<string, { args?: Record<string, unknown> }>): string {
+	for (const [key, val] of Object.entries(tc)) {
+		const name = key.replace(/ToolCall$/, "");
+		const label = TOOL_LABELS[name] || `🔧 ${name}`;
+		const a = val?.args;
+		if (!a) return label;
+		if (a.path) return `${label} ${basename(String(a.path))}`;
+		if (a.command) return `${label} ${String(a.command).slice(0, 80)}`;
+		if (a.pattern) return `${label} "${a.pattern}"${a.path ? ` in ${basename(String(a.path))}` : ""}`;
+		if (a.glob_pattern) return `${label} ${a.glob_pattern}`;
+		if (a.query) return `${label} ${String(a.query).slice(0, 60)}`;
+		if (a.search_term) return `${label} ${String(a.search_term).slice(0, 60)}`;
+		if (a.url) return `${label} ${String(a.url).slice(0, 60)}`;
+		if (a.description) return `${label} ${String(a.description).slice(0, 60)}`;
+		return label;
+	}
+	return "🔧 工具调用";
+}
+
+function describeToolResult(tc: Record<string, { args?: Record<string, unknown>; result?: Record<string, { content?: string }> }>): string {
+	for (const val of Object.values(tc)) {
+		const r = val?.result;
+		if (!r) return "";
+		const success = r.success as Record<string, unknown> | undefined;
+		if (success?.content) return String(success.content).slice(0, 200);
+		const err = r.error as Record<string, unknown> | undefined;
+		if (err?.message) return `❌ ${String(err.message).slice(0, 150)}`;
+	}
+	return "";
+}
+
+function basename(p: string): string {
+	const parts = p.split("/");
+	return parts[parts.length - 1] || p;
+}
+
+// 核心：spawn agent CLI，解析 stream-json，返回结果
+function execAgent(
+	lockKey: string,
+	workspace: string,
+	model: string,
+	prompt: string,
+	opts?: {
+		sessionId?: string;
+		onProgress?: (p: AgentProgress) => void;
+	},
+): Promise<{ result: string; sessionId?: string }> {
+	return new Promise((res, reject) => {
+		const args = [
+			"-p", "--force", "--trust", "--approve-mcps",
+			"--workspace", workspace,
+			"--model", model,
+			"--output-format", "stream-json",
+			"--stream-partial-output",
+		];
+
+		if (opts?.sessionId) {
+			args.push("--resume", opts.sessionId);
+		}
+		args.push("--", prompt);
+
+		let cancelled = false;
+		const child = spawn(AGENT_BIN, args, {
+			env: {
+				...process.env,
+				CURSOR_API_KEY: config.CURSOR_API_KEY,
+				FEISHU_APP_ID: config.FEISHU_APP_ID,
+				FEISHU_APP_SECRET: config.FEISHU_APP_SECRET,
+				FEISHU_USER_ACCESS_TOKEN: config.FEISHU_USER_ACCESS_TOKEN,
+				FEISHU_REFRESH_TOKEN: config.FEISHU_REFRESH_TOKEN,
+				VOLC_STT_APP_ID: config.VOLC_STT_APP_ID,
+				VOLC_STT_ACCESS_TOKEN: config.VOLC_STT_ACCESS_TOKEN,
+				VOLC_EMBEDDING_API_KEY: config.VOLC_EMBEDDING_API_KEY,
+				VOLC_EMBEDDING_MODEL: config.VOLC_EMBEDDING_MODEL,
+				CODEX_AGENT_TIMEOUT_MS: config.CODEX_AGENT_TIMEOUT_MS,
+			},
+			stdio: ["ignore", "pipe", "pipe"],
+			windowsHide: true,
+		});
+		if (child.pid) {
+			childPids.add(child.pid);
+			activeAgents.set(lockKey, {
+				pid: child.pid,
+				workspace,
+				lockKey,
+				startedAt: Date.now(),
+				kill: () => {
+					cancelled = true;
+					killProcessTree(child.pid!);
+				},
+			});
+		}
+
+		let stderr = "";
+		let resultText = "";
+		let sessionId: string | undefined;
+		let phase: AgentProgress["phase"] = "thinking";
+		let thinkingBuf = "";
+		let assistantBuf = "";
+		let lastSegment = "";
+		let toolBuf = ""; // 工具活动日志（显示在进度卡片中）
+		let done = false;
+		const startTime = Date.now();
+		let lastProgressTime = 0;
+		let lineBuf = "";
+
+		function cleanup() {
+			done = true;
+			clearInterval(timer);
+			if (child.pid) childPids.delete(child.pid);
+			activeAgents.delete(lockKey);
+		}
+
+		function getSnippet(): string {
+			if (phase === "thinking") return thinkingBuf.slice(-200);
+			if (phase === "tool_call") {
+				const lines = toolBuf.split("\n").filter(l => l.trim());
+				return lines.slice(-6).join("\n") || assistantBuf.slice(-300);
+			}
+			return assistantBuf.slice(-300);
+		}
+
+		const timer = setInterval(() => {
+			if (done) return;
+			const now = Date.now();
+			if (opts?.onProgress && now - lastProgressTime >= PROGRESS_INTERVAL) {
+				lastProgressTime = now;
+				const snippet = getSnippet();
+				if (snippet) {
+					opts.onProgress({
+						elapsed: Math.round((now - startTime) / 1000),
+						phase,
+						snippet,
+					});
+				}
+			}
+		}, 1000);
+
+		function processLine(line: string) {
+			const ev = tryParseJson(line);
+			if (!ev) return;
+
+			if (ev.session_id && !sessionId) sessionId = ev.session_id;
+
+			const prevPhase = phase;
+			switch (ev.type) {
+				case "thinking":
+					phase = "thinking";
+					if (ev.text) thinkingBuf += ev.text;
+					break;
+				case "assistant":
+					if (phase !== "responding") toolBuf = "";
+					phase = "responding";
+					if (ev.message?.content) {
+						for (const c of ev.message.content) {
+							if (c.type === "text" && c.text) {
+								assistantBuf += c.text;
+								lastSegment += c.text;
+							}
+						}
+					}
+					break;
+				case "tool_call":
+					phase = "tool_call";
+					lastSegment = "";
+					if (ev.tool_call) {
+						if (ev.subtype === "started") {
+							const desc = describeToolCall(ev.tool_call);
+							toolBuf += (toolBuf ? "\n" : "") + desc;
+						} else if (ev.subtype === "completed") {
+							const brief = describeToolResult(ev.tool_call);
+							if (brief) {
+								const oneLiner = brief.split("\n").filter(l => l.trim()).slice(0, 2).join(" | ");
+								toolBuf += `  → ${oneLiner.slice(0, 120)}`;
+							}
+						}
+					}
+					break;
+				case "result":
+					if (ev.result != null) resultText = ev.result;
+					if (ev.subtype === "error" && ev.error) {
+						resultText = ev.error;
+					}
+					break;
+			}
+
+			// 阶段切换 或 tool_call 新事件时立即触发进度更新
+			const isToolEvent = ev.type === "tool_call" && ev.tool_call;
+			if ((phase !== prevPhase || isToolEvent) && opts?.onProgress) {
+				const now = Date.now();
+				if (now - lastProgressTime < PROGRESS_INTERVAL) return;
+				lastProgressTime = now;
+				opts.onProgress({
+					elapsed: Math.round((now - startTime) / 1000),
+					phase,
+					snippet: getSnippet() || "...",
+				});
+			}
+		}
+
+		child.stdout!.on("data", (chunk: Buffer) => {
+			lineBuf += chunk.toString();
+			const lines = lineBuf.split("\n");
+			lineBuf = lines.pop()!;
+			for (const line of lines) processLine(line);
+		});
+
+		child.stderr!.on("data", (chunk: Buffer) => {
+			stderr += chunk.toString();
+		});
+
+		child.on("close", (code) => {
+			if (done) return;
+			cleanup();
+			// 处理 lineBuf 中残留的最后一行
+			if (lineBuf.trim()) processLine(lineBuf);
+
+			if (cancelled) {
+				reject(new Error("任务已被用户中止"));
+				return;
+			}
+
+			// 优先取最后一段 assistant 回复（最终结果），避免输出中间过程
+			const finalSegment = strip(lastSegment);
+			const output = finalSegment || resultText || strip(assistantBuf) || strip(stderr) || "(无输出)";
+
+			if (code !== 0 && code !== null && !resultText) {
+				reject(new Error(strip(stderr) || output));
+				return;
+			}
+			if (isBillingError(output) || isBillingError(stderr)) {
+				reject(new Error(output));
+				return;
+			}
+			res({ result: output, sessionId });
+		});
+
+		child.on("error", (err) => {
+			if (!done) { cleanup(); reject(err); }
+		});
+	});
+}
+
+// ── 会话级活跃追踪（lockKey = session:id 或 ws:path）──────
+const busySessions = new Set<string>();
+
+// ── 发送消息（会话优先，欠费降级 auto）──────────
+async function runAgent(
+	workspace: string,
+	prompt: string,
+	opts?: {
+		sessionKey?: string;
+		onProgress?: (p: AgentProgress) => void;
+		onStart?: () => void;
+	},
+): Promise<{ result: string; quotaWarning?: string }> {
+	const primaryModel = config.CURSOR_MODEL;
+	const sessionKey = opts?.sessionKey || workspace;
+	const lockKey = getLockKey(sessionKey);
+
+	return withSessionLock(lockKey, async () => {
+		busySessions.add(lockKey);
+		opts?.onStart?.();
+		try {
+			const existingSessionId = getActiveSessionId(sessionKey);
+			const isNewSession = !existingSessionId;
+
+			try {
+				const { result, sessionId } = await execAgent(lockKey, workspace, primaryModel, prompt, {
+					sessionId: existingSessionId,
+					onProgress: opts?.onProgress,
+				});
+				if (sessionId) {
+					setActiveSession(sessionKey, sessionId);
+					if (isNewSession) {
+						generateSessionTitle(sessionKey, sessionId, prompt, result);
+					}
+				}
+				return { result };
+			} catch (err) {
+				const e = err instanceof Error ? err : new Error(String(err));
+
+				if (isCancellationError(e.message)) {
+					throw e;
+				}
+
+				if (existingSessionId && !isBillingError(e.message)) {
+					console.warn(`[重试] 会话可能过期，重新创建: ${e.message.slice(0, 100)}`);
+					archiveAndResetSession(sessionKey);
+					try {
+						const { result, sessionId } = await execAgent(lockKey, workspace, primaryModel, prompt, {
+							onProgress: opts?.onProgress,
+						});
+						if (sessionId) {
+							setActiveSession(sessionKey, sessionId);
+							generateSessionTitle(sessionKey, sessionId, prompt, result);
+						}
+						return { result };
+					} catch (retryErr) {
+						const re = retryErr instanceof Error ? retryErr : new Error(String(retryErr));
+						if (isCancellationError(re.message)) throw re;
+						if (!isBillingError(re.message)) throw re;
+					}
+				}
+
+				if (isBillingError(e.message)) {
+					console.error(`[降级] ${primaryModel} 欠费: ${e.message.slice(0, 200)}`);
+					const fallbackSessionId = getActiveSessionId(sessionKey);
+					try {
+						const { result, sessionId: newSid } = await execAgent(lockKey, workspace, "auto", prompt, {
+							sessionId: fallbackSessionId,
+							onProgress: opts?.onProgress,
+						});
+						if (newSid) {
+							setActiveSession(sessionKey, newSid);
+							if (!fallbackSessionId) {
+								generateSessionTitle(sessionKey, newSid, prompt, result);
+							}
+						}
+						return {
+							result,
+							quotaWarning: `⚠️ **模型降级通知**\n\n${primaryModel} 欠费，本次已用 auto 完成。\n\n> ${e.message.slice(0, 100)}`,
+						};
+					} catch {
+						throw e;
+					}
+				}
+
+				archiveAndResetSession(sessionKey);
+				throw e;
+			}
+		} finally {
+			busySessions.delete(lockKey);
+		}
+	});
+}
+
+// ── 去重 + 并发控制 + 排队 ───────────────────────
+const seen = new Map<string, number>();
+function isDup(id: string): boolean {
+	const now = Date.now();
+	for (const [k, t] of seen) if (now - t > 60_000) seen.delete(k);
+	if (seen.has(id)) return true;
+	seen.set(id, now);
+	return false;
+}
+// ── 消息处理 ─────────────────────────────────────
+async function handle(params: {
+	text: string;
+	messageId: string;
+	chatId: string;
+	chatType: string;
+	messageType: string;
+	content: string;
+}) {
+	const { messageId, chatId, chatType, messageType, content } = params;
+	let { text } = params;
+	// 记录最近活跃会话用于定时任务/心跳主动推送
+	lastActiveChatId = chatId;
+	console.log(`[${new Date().toISOString()}] [${messageType}] ${text.slice(0, 80)}`);
+
+	return handleInner(text, messageId, chatId, chatType, messageType, content);
+}
+
+async function handleInner(
+	text: string,
+	messageId: string,
+	chatId: string,
+	chatType: string,
+	messageType: string,
+	content: string,
+): Promise<void> {
+	let cardId: string | undefined;
+	const isGroup = chatType === "group";
+	// 处理媒体附件
+	const parsed = parseContent(messageType, content);
+	try {
+		const imageKeys = parsed.imageKeys || (parsed.imageKey ? [parsed.imageKey] : []);
+		if (imageKeys.length) {
+			const imagePaths: string[] = [];
+			for (const imageKey of imageKeys.slice(0, 10)) {
+				imagePaths.push(await downloadMedia(messageId, imageKey, "image", ".png"));
+			}
+			const attachments = imagePaths.map((path) => `[附件图片: ${path}]`).join("\n");
+			text = text
+				? `${text}\n\n${attachments}`
+				: `用户发了 ${imagePaths.length} 张图片，已保存到：\n${attachments}\n请查看并回复。`;
+		}
+		if (parsed.fileKey && messageType === "audio") {
+			if (!cardId) {
+				cardId = await replyCard(messageId, "🎙️ 正在识别语音...", { title: "语音识别中", color: "wathet" });
+			} else {
+				await updateCard(cardId, "🎙️ 正在识别语音...", { title: "语音识别中", color: "wathet" });
+			}
+			const audioPath = await downloadMedia(messageId, parsed.fileKey, "file", ".ogg");
+			const transcript = await transcribeAudio(audioPath);
+			try { unlinkSync(audioPath); } catch {}
+			if (transcript) {
+				text = transcript;
+				console.log(`[语音] 转文字成功: ${transcript.slice(0, 80)}`);
+			} else {
+				text = `用户发了一条语音消息，音频文件在 ${audioPath}，请处理并回复。`;
+				console.warn("[语音] 转文字失败，传原始文件路径");
+			}
+		}
+		if (parsed.fileKey && messageType === "file") {
+			const dotIdx = parsed.fileName?.lastIndexOf(".");
+			const ext = dotIdx != null && dotIdx > 0 ? parsed.fileName!.slice(dotIdx) : "";
+			const path = await downloadMedia(messageId, parsed.fileKey, "file", ext);
+			text = text
+				? `${text}\n\n[附件: ${path}]`
+				: `用户发了文件 ${parsed.fileName || ""}，已保存到 ${path}`;
+		}
+	} catch (e) {
+		console.error("[下载失败]", e);
+		if (!text) {
+			if (cardId) await updateCard(cardId, "❌ 媒体下载失败，请重新发送", { color: "red" });
+			else await replyCard(messageId, "❌ 媒体下载失败，请重新发送");
+			return;
+		}
+	}
+
+	if (!text) return;
+
+	// /apikey、/密钥、/换key → 更换 Cursor API Key
+	if (/^\/?(?:apikey|api\s*key|密钥|换key|更换密钥)\s*$/i.test(text.trim())) {
+		const keyPreview = config.CURSOR_API_KEY ? `\`...${config.CURSOR_API_KEY.slice(-8)}\`` : "**未设置**";
+		await replyCard(messageId, `当前 Key：${keyPreview}\n\n更换方式：\`/密钥 key_xxx...\` 或 \`/apikey key_xxx...\`\n\n[生成新 Key →](https://cursor.com/dashboard)`, { title: "API Key", color: "blue" });
+		return;
+	}
+	const apikeyMatch = text.match(/^\/?(?:api\s*key|密钥|换key|更换密钥)[\s:：=]*(.+)/i);
+	if (apikeyMatch) {
+		if (isGroup) {
+			await replyCard(messageId, "⚠️ **安全提醒：请勿在群聊中发送 API Key！**\n\n请在与机器人的 **私聊** 中发送 `/apikey` 指令。", { title: "安全提醒", color: "red" });
+			return;
+		}
+		const rawKey = apikeyMatch[1].trim().replace(/^["'`]+|["'`]+$/g, "");
+		if (!rawKey || rawKey.length < 20) {
+			await replyCard(messageId, "❌ Key 格式不对，太短了。请发送完整的 Cursor API Key。\n\n支持格式：\n- `/apikey key_xxxx...`\n- `/密钥 key_xxxx...`\n- `/换key key_xxxx...`", { title: "格式错误", color: "red" });
+			return;
+		}
+		try {
+			const envContent = readFileSync(ENV_PATH, "utf-8");
+			const updated = envContent.replace(/^CURSOR_API_KEY=.*$/m, `CURSOR_API_KEY=${rawKey}`);
+			writeFileSync(ENV_PATH, updated);
+			await replyCard(messageId, `**API Key 已更换**\n\n新 Key: \`...${rawKey.slice(-8)}\`\n\n已写入 .env 并自动生效。`, { title: "Key 已更新", color: "green" });
+			console.log(`[指令] API Key 已通过飞书更换 (...${rawKey.slice(-8)})`);
+		} catch (err) {
+			await replyCard(messageId, `❌ 写入失败: ${err instanceof Error ? err.message : err}`, { color: "red" });
+		}
+		return;
+	}
+
+	// /help → 显示所有可用指令
+	const helpMatch = text.trim().match(/^\/(help|帮助|指令)\s*$/i);
+	if (helpMatch) {
+		const en = helpMatch[1].toLowerCase() === "help";
+		const c = (zh: string, enAlias?: string) => en && enAlias ? `\`${zh}\` \`${enAlias}\`` : `\`${zh}\``;
+		const helpText = [
+			"**基础指令**",
+			`- ${c("/帮助", "/help")} — 显示本帮助`,
+			`- ${c("/状态", "/status")} — 查看服务状态`,
+			`- ${c("/git认证", "/git auth")} — 查看 Git/GitHub 认证自检`,
+			`- ${c("/新对话", "/new")} — 重置当前会话`,
+			`- ${c("/终止", "/stop")} — 终止正在执行的任务`,
+			"",
+			"**会话管理**",
+			`- ${c("/话题", "/topic")} — 查看/切换话题`,
+			`- \`/话题 新建 名称\` — 创建并切换到新话题`,
+			`- \`/话题 编号或名称\` — 切换话题`,
+			`- \`/话题 默认\` — 回到默认话题`,
+			`- ${c("/会话", "/sessions")} — 查看最近会话列表`,
+			`- \`/会话 编号\` — 切换到指定会话`,
+			`- ${c("/新对话", "/new")} — 归档当前会话，开启新对话`,
+			"",
+			"**模型与密钥**",
+			`- ${c("/模型", "/model")} — 查看/切换 AI 模型`,
+			`- ${c("/密钥", "/apikey")} — 查看/更换 API Key（仅私聊）`,
+			"  用法：`/密钥 key_xxx...`",
+			"",
+			"**记忆系统**",
+			`- ${c("/记忆", "/memory")} — 查看记忆状态`,
+			`- \`/记忆 关键词\` — 语义搜索记忆`,
+			`- \`/记录 内容\` — 写入今日日记`,
+			`- ${c("/整理记忆", "/reindex")} — 重建记忆索引`,
+			"",
+			"**定时任务**",
+			`- ${c("/任务", "/cron")} — 查看所有定时任务`,
+			"- `/任务 暂停/恢复/删除/执行 ID`",
+			"- 或在对话中说「每天早上9点做XX」由 AI 自动创建",
+			"",
+			"**心跳系统**",
+			`- ${c("/心跳", "/heartbeat")} — 查看心跳状态`,
+			"- `/心跳 开启/关闭/执行`",
+			"- `/心跳 间隔 分钟数`",
+			"",
+			"**项目路由**",
+			`发送 \`项目名:消息\` 指定工作区，如 \`openclaw:帮我看看这个bug\``,
+			`可用项目：${Object.keys(projectsConfig.projects).map((k) => `\`${k}\``).join("、")}（默认：\`${projectsConfig.default_project}\`）`,
+		].join("\n");
+		await replyCard(messageId, helpText, { title: "📖 使用帮助", color: "blue" });
+		return;
+	}
+
+	// /status → 服务状态一览
+	if (/^\/(status|状态)\s*$/i.test(text.trim())) {
+		const keyPreview = config.CURSOR_API_KEY ? `\`...${config.CURSOR_API_KEY.slice(-8)}\`` : "**未设置**";
+		const sttStatus = config.VOLC_STT_APP_ID ? "火山引擎豆包大模型" : (existsSync(WHISPER_MODEL) ? "本地 whisper" : "不可用");
+		const projects = Object.entries(projectsConfig.projects).map(([k, v]) => `  \`${k}\` → ${v.path}`).join("\n");
+		const statusRoute = route(text);
+		const currentTopic = getActiveTopic(chatId, statusRoute.workspace);
+		const sessions = [...sessionsStore.entries()]
+			.filter(([, s]) => s.active)
+			.map(([ws, s]) => {
+				const entry = s.history.find((h) => h.id === s.active);
+				const info = entry ? ` · ${entry.summary.slice(0, 30)}` : "";
+				return `  \`${describeSessionScope(ws)}\` → ${s.active!.slice(0, 12)}...${info}`;
+			}).join("\n") || "  (无活跃会话)";
+		const memStatus = memory
+			? (() => {
+				const stats = memory.getStats();
+				return `全工作区索引（${stats.chunks} 块, ${stats.files} 文件, ${stats.cachedEmbeddings} 嵌入缓存）`;
+			})()
+			: "未启用";
+		const statusText = [
+			`**模型：** ${config.CURSOR_MODEL}`,
+			`**Key：** ${keyPreview}`,
+			`**STT：** ${sttStatus}`,
+			`**记忆：** ${memStatus}`,
+			`**调度：** ${(() => { const s = scheduler.getStats(); return s.total > 0 ? `${s.enabled}/${s.total} 任务${s.nextRunIn ? `（下次: ${s.nextRunIn}）` : ""}` : "无任务"; })()}`,
+			`**心跳：** ${heartbeat.getStatus().enabled ? `每 ${Math.round(heartbeat.getStatus().everyMs / 60000)} 分钟` : "未启用"}`,
+			`**当前话题：** ${topicDisplayName(currentTopic)}`,
+			`**活跃任务：** ${busySessions.size} 个运行中`,
+			"",
+			"**项目路由：**",
+			projects,
+			"",
+			"**活跃会话：**",
+			sessions,
+		].join("\n");
+		await replyCard(messageId, statusText, { title: "服务状态", color: "blue" });
+		return;
+	}
+
+	// /git认证、/git auth → Git/GitHub 认证自检（不输出密钥）
+	const gitAuthRoute = route(text);
+	if (/^\/(?:git认证|git-auth|gitauth|git\s*auth|认证状态)\s*$/i.test(gitAuthRoute.prompt.trim())) {
+		const report = buildGitAuthDiagnostics(gitAuthRoute.workspace);
+		await replyCard(messageId, report, { title: `Git 认证自检 · ${gitAuthRoute.label}`, color: "blue" });
+		return;
+	}
+
+	// /model、/模型、/切换模型 → 切换模型
+	const modelMatch = text.match(/^\/(model|模型|切换模型)[\s:：=]*(.*)/i);
+	if (modelMatch) {
+		const input = modelMatch[2].trim();
+
+		// 无参数 → 显示模型列表
+		if (!input) {
+			await replyCard(messageId, buildModelListCard(config.CURSOR_MODEL), { title: "选择模型", color: "blue" });
+			return;
+		}
+
+		const { exact, candidates } = fuzzyMatchModel(input);
+
+		if (exact) {
+			// 精确匹配或唯一模糊匹配 → 直接切换
+			if (exact.id === config.CURSOR_MODEL) {
+				await replyCard(messageId, `当前已是 **${exact.id}**（${exact.desc}），无需切换。`, { title: "当前模型", color: "blue" });
+				return;
+			}
+			const envContent = readFileSync(ENV_PATH, "utf-8");
+			const updated = envContent.match(/^CURSOR_MODEL=/m)
+				? envContent.replace(/^CURSOR_MODEL=.*$/m, `CURSOR_MODEL=${exact.id}`)
+				: `${envContent.trimEnd()}\nCURSOR_MODEL=${exact.id}\n`;
+			writeFileSync(ENV_PATH, updated);
+			const prev = config.CURSOR_MODEL;
+			await replyCard(messageId, `${prev} → **${exact.id}**（${exact.desc}）\n\n已写入 .env，2 秒内自动生效。`, { title: "模型已切换", color: "green" });
+			console.log(`[指令] 模型切换: ${prev} → ${exact.id}`);
+			return;
+		}
+
+		if (candidates.length > 1) {
+			// 多个候选 → 提示用户精确选择
+			const list = candidates.map((m) => `- \`${m.id}\`（${m.desc}）`).join("\n");
+			await replyCard(messageId, `「${input}」匹配到多个模型：\n\n${list}\n\n请输入更精确的名称或编号。`, { title: "请精确选择", color: "orange" });
+			return;
+		}
+
+		// 列表外的自定义模型名 → 确认后切换
+		if (input.length < 2 || /^\d+$/.test(input)) {
+			await replyCard(messageId, buildModelListCard(config.CURSOR_MODEL, `「${input}」无匹配，请从列表中选择`), { title: "未找到模型", color: "orange" });
+			return;
+		}
+
+		const envContent = readFileSync(ENV_PATH, "utf-8");
+		const updated = envContent.match(/^CURSOR_MODEL=/m)
+			? envContent.replace(/^CURSOR_MODEL=.*$/m, `CURSOR_MODEL=${input}`)
+			: `${envContent.trimEnd()}\nCURSOR_MODEL=${input}\n`;
+		writeFileSync(ENV_PATH, updated);
+		const prev = config.CURSOR_MODEL;
+		await replyCard(messageId, `${prev} → **${input}**\n\n⚠️ 此模型不在常用列表中，若名称有误可能导致执行失败。\n发送 \`/模型\` 查看常用列表。`, { title: "模型已切换", color: "yellow" });
+		console.log(`[指令] 模型切换(自定义): ${prev} → ${input}`);
+		return;
+	}
+
+	// /stop、/cancel、停止、取消 → 终止当前会话运行的 agent
+	const stopRoute = route(text);
+	const stopText = stopRoute.prompt.trim();
+	const stopMatch = stopText.match(/^\/?(stop|cancel|abort|kill|终止|停止|中止|取消|别跑了|停一下)(?:\s+(all|全部))?$/i);
+	const naturalStop = /^(停止你的思考|停止思考|停止执行|停止任务|终止任务|中止任务|取消任务|别执行了|别想了|不用了|停下)$/i.test(stopText);
+	if (stopMatch || naturalStop || /^(停止全部|终止全部|中止全部|取消全部)$/i.test(stopText)) {
+		const stopAll = Boolean(stopMatch?.[2]) || /全部$/i.test(stopText);
+		const stopTopic = getActiveTopic(chatId, stopRoute.workspace);
+		const stopped = stopActiveAgents(stopRoute.workspace, stopTopic.sessionKey, stopAll);
+		if (stopped.length > 0) {
+			const target = stopAll ? `全部 ${stopped.length} 个任务` : `当前话题「${topicDisplayName(stopTopic)}」的任务`;
+			await replyCard(messageId, `已发送终止信号：${target}。\n\n如果任务正在执行系统命令，可能需要几秒钟清理子进程。`, { title: "已终止", color: "orange" });
+		} else {
+			await replyCard(messageId, "当前没有正在运行的任务。", { title: "无任务", color: "grey" });
+		}
+		return;
+	}
+
+	// /记忆、/memory → 记忆系统操作
+	const memoryMatch = text.match(/^\/(记忆|memory|搜索记忆|recall)[\s:：=]*(.*)/i);
+	if (memoryMatch) {
+		if (!memory) {
+			await replyCard(messageId, "记忆系统未初始化（缺少向量嵌入 API Key）。\n\n请在 `.env` 中设置 `VOLC_EMBEDDING_API_KEY`。", { title: "记忆不可用", color: "orange" });
+			return;
+		}
+		const query = memoryMatch[2].trim();
+		if (!query) {
+			const summary = memory.getRecentSummary(3);
+			const stats = memory.getStats();
+			const fileList = stats.filePaths.length > 0
+				? stats.filePaths.slice(0, 25).map((p) => `- \`${p}\``).join("\n") + (stats.filePaths.length > 25 ? `\n- …及其他 ${stats.filePaths.length - 25} 个文件` : "")
+				: "（尚未索引，请发送 `/整理记忆`）";
+			const statusText = [
+				`**记忆索引：** ${stats.chunks} 块（${stats.files} 文件, ${stats.cachedEmbeddings} 嵌入缓存）`,
+				`**索引范围：** 工作区全部文本文件（.md .txt .html .json .mdc 等）`,
+				`**嵌入模型：** ${config.VOLC_EMBEDDING_MODEL}`,
+				"",
+				"**用法：**",
+				"- `/记忆 关键词` — 语义搜索记忆",
+				"- `/记录 内容` — 写入今日日记",
+				"- `/整理记忆` — 重建全工作区索引",
+				"",
+				`**已索引文件：**\n${fileList}`,
+				"",
+				summary ? `**最近记忆摘要：**\n\n${summary.slice(0, 1500)}` : "（暂无记忆文件）",
+			].join("\n");
+			await replyCard(messageId, statusText, { title: "🧠 记忆系统", color: "purple" });
+			return;
+		}
+		try {
+			const results = await memory.search(query, 5);
+			if (results.length === 0) {
+				await replyCard(messageId, `未找到与「${query}」相关的记忆。\n\n索引范围：工作区全部文本文件（发 \`/整理记忆\` 可刷新）`, { title: "无匹配", color: "grey" });
+				return;
+			}
+			const lines = results.map((r, i) =>
+				`**${i + 1}.** \`${r.path}#L${r.startLine}\`（相关度 ${(r.score * 100).toFixed(0)}%）\n${r.text.slice(0, 300)}`,
+			);
+			await replyCard(messageId, lines.join("\n\n---\n\n"), { title: `🔍 搜索「${query}」`, color: "purple" });
+		} catch (e) {
+			await replyCard(messageId, `搜索失败: ${e instanceof Error ? e.message : e}`, { color: "red" });
+		}
+		return;
+	}
+
+	// /记录 → 快速写入今日日记
+	const logMatch = text.match(/^\/(记录|log|note)[\s:：=]+(.+)/is);
+	if (logMatch) {
+		if (!memory) {
+			await replyCard(messageId, "记忆系统未初始化。", { title: "不可用", color: "orange" });
+			return;
+		}
+		const content = logMatch[2].trim();
+		const path = memory.appendDailyLog(content);
+		await replyCard(messageId, `已记录到今日日记。\n\n\`${path}\``, { title: "📝 已记录", color: "green" });
+		return;
+	}
+
+	// /整理记忆 → 重建全工作区记忆索引
+	if (/^\/(整理记忆|reindex|索引)\s*$/i.test(text.trim())) {
+		if (!memory) {
+			await replyCard(messageId, "记忆系统未初始化。", { title: "不可用", color: "orange" });
+			return;
+		}
+		const reindexCardId = await replyCard(messageId, "⏳ 正在扫描并索引工作区全部文本文件...", { title: "全工作区索引中", color: "wathet" });
+		try {
+			const count = await memory.index();
+			const stats = memory.getStats();
+			const msg = [
+				`索引完成: **${count}** 个记忆块（来自 **${stats.files}** 个文件）`,
+				`嵌入缓存: ${stats.cachedEmbeddings} 条`,
+				`嵌入模型: \`${config.VOLC_EMBEDDING_MODEL}\``,
+				"",
+				"**已索引文件：**",
+				...stats.filePaths.slice(0, 25).map((p) => `- \`${p}\``),
+				...(stats.filePaths.length > 25 ? [`- …及其他 ${stats.filePaths.length - 25} 个文件`] : []),
+			].join("\n");
+			if (reindexCardId) await updateCard(reindexCardId, msg, { title: "✅ 全工作区索引完成", color: "green" });
+			else await replyCard(messageId, msg, { title: "✅ 全工作区索引完成", color: "green" });
+		} catch (e) {
+			const msg = `索引失败: ${e instanceof Error ? e.message : e}`;
+			if (reindexCardId) await updateCard(reindexCardId, msg, { title: "索引失败", color: "red" });
+			else await replyCard(messageId, msg, { color: "red" });
+		}
+		return;
+	}
+
+	// /任务、/cron、/定时 → 定时任务管理
+	const taskMatch = text.match(/^\/(任务|cron|定时|task|schedule|定时任务)[\s:：]*(.*)/i);
+	if (taskMatch) {
+		const subCmd = taskMatch[2].trim().toLowerCase();
+
+		if (!subCmd || subCmd === "list" || subCmd === "列表") {
+			const jobs = await scheduler.list();
+			if (jobs.length === 0) {
+				await replyCard(messageId, "暂无定时任务。\n\n在对话中告诉 AI「每天早上9点检查邮件」即可自动创建，\n或手动编辑工作区的 `cron-jobs.json`。", { title: "📋 定时任务", color: "blue" });
+				return;
+			}
+			const lines = jobs.map((j, i) => {
+				const status = j.enabled ? "✅" : "⏸";
+				const schedDesc = j.schedule.kind === "at" ? `一次性 ${j.schedule.at}` :
+					j.schedule.kind === "every" ? `每 ${Math.round(j.schedule.everyMs / 60000)} 分钟` :
+					`cron: ${j.schedule.expr}`;
+				const lastRun = j.state.lastRunAtMs ? new Date(j.state.lastRunAtMs).toLocaleString("zh-CN") : "从未执行";
+				return `${status} **${i + 1}. ${j.name}**\n   调度: ${schedDesc}\n   上次: ${lastRun}\n   ID: \`${j.id.slice(0, 8)}\``;
+			});
+			const stats = scheduler.getStats();
+			lines.push("", `共 ${stats.total} 个任务（${stats.enabled} 启用）${stats.nextRunIn ? `，下次执行: ${stats.nextRunIn}` : ""}`);
+			await replyCard(messageId, lines.join("\n"), { title: "📋 定时任务", color: "blue" });
+			return;
+		}
+
+		// /任务 暂停 ID
+		const pauseMatch = subCmd.match(/^(暂停|pause|disable)\s+(\S+)/i);
+		if (pauseMatch) {
+			const idPrefix = pauseMatch[2];
+			const job = (await scheduler.list(true)).find((j) => j.id.startsWith(idPrefix));
+			if (!job) { await replyCard(messageId, `未找到 ID 为 \`${idPrefix}\` 的任务`, { title: "未找到", color: "orange" }); return; }
+			await scheduler.update(job.id, { enabled: false });
+			await replyCard(messageId, `已暂停: **${job.name}**`, { title: "⏸ 已暂停", color: "orange" });
+			return;
+		}
+
+		// /任务 恢复 ID
+		const resumeMatch = subCmd.match(/^(恢复|resume|enable)\s+(\S+)/i);
+		if (resumeMatch) {
+			const idPrefix = resumeMatch[2];
+			const job = (await scheduler.list(true)).find((j) => j.id.startsWith(idPrefix));
+			if (!job) { await replyCard(messageId, `未找到 ID 为 \`${idPrefix}\` 的任务`, { title: "未找到", color: "orange" }); return; }
+			await scheduler.update(job.id, { enabled: true });
+			await replyCard(messageId, `已恢复: **${job.name}**`, { title: "✅ 已恢复", color: "green" });
+			return;
+		}
+
+		// /任务 删除 ID
+		const delMatch = subCmd.match(/^(删除|delete|remove|del)\s+(\S+)/i);
+		if (delMatch) {
+			const idPrefix = delMatch[2];
+			const job = (await scheduler.list(true)).find((j) => j.id.startsWith(idPrefix));
+			if (!job) { await replyCard(messageId, `未找到 ID 为 \`${idPrefix}\` 的任务`, { title: "未找到", color: "orange" }); return; }
+			await scheduler.remove(job.id);
+			await replyCard(messageId, `已删除: **${job.name}**`, { title: "🗑 已删除", color: "grey" });
+			return;
+		}
+
+		// /任务 执行 ID
+		const runMatch = subCmd.match(/^(执行|run|trigger)\s+(\S+)/i);
+		if (runMatch) {
+			const idPrefix = runMatch[2];
+			const job = (await scheduler.list(true)).find((j) => j.id.startsWith(idPrefix));
+			if (!job) { await replyCard(messageId, `未找到 ID 为 \`${idPrefix}\` 的任务`, { title: "未找到", color: "orange" }); return; }
+			await replyCard(messageId, `正在手动执行: **${job.name}**...`, { title: "▶ 执行中", color: "wathet" });
+			const result = await scheduler.run(job.id);
+			await replyCard(messageId, result.status === "ok" ? `执行成功: **${job.name}**` : `执行失败: ${result.error}`, {
+				title: result.status === "ok" ? "✅ 完成" : "❌ 失败",
+				color: result.status === "ok" ? "green" : "red",
+			});
+			return;
+		}
+
+		await replyCard(messageId, "未知子命令。\n\n用法：\n- `/任务` — 查看所有任务\n- `/任务 暂停 ID` — 暂停任务\n- `/任务 恢复 ID` — 恢复任务\n- `/任务 删除 ID` — 删除任务\n- `/任务 执行 ID` — 手动执行", { title: "用法", color: "orange" });
+		return;
+	}
+
+	// /心跳 → 心跳系统管理
+	const hbMatch = text.match(/^\/(心跳|heartbeat|hb)[\s:：]*(.*)/i);
+	if (hbMatch) {
+		const subCmd = hbMatch[2].trim().toLowerCase();
+
+		if (!subCmd || subCmd === "status" || subCmd === "状态") {
+			const s = heartbeat.getStatus();
+			const statusText = [
+				`**状态：** ${s.enabled ? "✅ 已启用" : "⏸ 已关闭"}`,
+				`**间隔：** 每 ${Math.round(s.everyMs / 60000)} 分钟`,
+				s.lastRunAt ? `**上次执行：** ${new Date(s.lastRunAt).toLocaleString("zh-CN")}` : "**上次执行：** 从未",
+				s.nextRunAt ? `**下次执行：** ${new Date(s.nextRunAt).toLocaleString("zh-CN")}` : "",
+				s.lastStatus ? `**上次状态：** ${s.lastStatus}` : "",
+				"",
+				"**用法：**",
+				"- `/心跳 开启` — 启动心跳检查",
+				"- `/心跳 关闭` — 停止心跳检查",
+				"- `/心跳 执行` — 立即执行一次",
+				"- `/心跳 间隔 分钟数` — 设置间隔",
+				"",
+				"编辑工作区的 `.cursor/HEARTBEAT.md` 可自定义检查清单。",
+			].filter(Boolean).join("\n");
+			await replyCard(messageId, statusText, { title: "💓 心跳系统", color: "purple" });
+			return;
+		}
+
+		if (/^(开启|enable|on|start|启动)$/i.test(subCmd)) {
+			heartbeat.updateConfig({ enabled: true });
+			await replyCard(messageId, `心跳已开启，每 ${Math.round(heartbeat.getStatus().everyMs / 60000)} 分钟检查一次。\n\n编辑 \`.cursor/HEARTBEAT.md\` 自定义检查清单。`, { title: "💓 已开启", color: "green" });
+			return;
+		}
+
+		if (/^(关闭|disable|off|stop|停止)$/i.test(subCmd)) {
+			heartbeat.updateConfig({ enabled: false });
+			await replyCard(messageId, "心跳已关闭。", { title: "💓 已关闭", color: "grey" });
+			return;
+		}
+
+		if (/^(执行|run|check|检查)$/i.test(subCmd)) {
+			await replyCard(messageId, "💓 正在执行心跳检查...", { title: "执行中", color: "wathet" });
+			const result = await heartbeat.runOnce();
+			if (result.status === "ran") {
+				await replyCard(messageId, result.hasContent ? "心跳检查完成，发现需要关注的事项（已发送）" : "心跳检查完成，一切正常 ✅", {
+					title: "💓 检查完成",
+					color: "green",
+				});
+			} else {
+				await replyCard(messageId, `跳过: ${result.reason}`, { title: "💓 跳过", color: "grey" });
+			}
+			return;
+		}
+
+		const intervalMatch = subCmd.match(/^(间隔|interval)\s+(\d+)/i);
+		if (intervalMatch) {
+			const mins = Number.parseInt(intervalMatch[2], 10);
+			if (mins < 1 || mins > 1440) {
+				await replyCard(messageId, "间隔范围: 1-1440 分钟", { title: "无效", color: "orange" });
+				return;
+			}
+			heartbeat.updateConfig({ everyMs: mins * 60_000 });
+			await replyCard(messageId, `心跳间隔已设为 **${mins} 分钟**`, { title: "💓 已更新", color: "green" });
+			return;
+		}
+
+		await replyCard(messageId, "未知子命令。发送 `/心跳` 查看用法。", { title: "用法", color: "orange" });
+		return;
+	}
+
+	// /new、/新对话、/新会话 → 归档当前会话，开启新对话
+	const { workspace, prompt, label } = route(text);
+	const activeTopic = getActiveTopic(chatId, workspace);
+	const topicSessionKey = activeTopic.sessionKey;
+
+	// /话题、/topic → 当前聊天内按话题隔离 Codex 会话
+	const topicCmdMatch = prompt.match(/^\/(话题|topics?)[\s:：]*(.*)/i);
+	if (topicCmdMatch) {
+		const subArg = topicCmdMatch[2].trim();
+		const history = getTopicHistory(chatId, workspace);
+		const active = getActiveTopic(chatId, workspace);
+		const title = `话题 · ${label}`;
+
+		if (!subArg || /^(列表|list)$/i.test(subArg)) {
+			const lines: string[] = [];
+			lines.push(`**工作区：** \`${label}\``);
+			lines.push(`**当前话题：** ${topicDisplayName(active)}\n`);
+			for (let i = 0; i < history.length; i++) {
+				const t = history[i];
+				const isCurrent = t.id === active.id;
+				const tag = isCurrent ? " ← **当前**" : "";
+				const time = formatRelativeTime(t.lastActiveAt);
+				const session = getActiveSessionId(t.sessionKey);
+				const sessionInfo = session ? ` · 会话 \`${session.slice(0, 8)}\`` : " · 尚未开始会话";
+				lines.push(`**${i + 1}.** ${topicDisplayName(t)}${tag}\n   ${time}${sessionInfo}`);
+			}
+			lines.push("", "---", "切换：`/话题 编号或名称`　新建：`/话题 新建 名称`　回默认：`/话题 默认`");
+			await replyCard(messageId, lines.join("\n"), { title, color: "blue" });
+			return;
+		}
+
+		if (/^(新建|创建|new|create|切换|switch|use|重命名|rename|删除|delete|remove|del)$/i.test(subArg)) {
+			await replyCard(messageId, "缺少话题名称或编号。\n\n例如：`/话题 新建 sros部署`、`/话题 1`、`/话题 默认`", { title: "缺少参数", color: "orange" });
+			return;
+		}
+
+		const newMatch = subArg.match(/^(新建|创建|new|create)\s+(.+)/i);
+		if (newMatch) {
+			const topic = createOrSwitchTopic(chatId, workspace, newMatch[2]);
+			if (!topic) {
+				await replyCard(messageId, "请输入话题名称，例如：`/话题 新建 sros部署`", { title: "缺少名称", color: "orange" });
+				return;
+			}
+			await replyCard(messageId, `已切换到话题：**${topicDisplayName(topic)}**\n\n下一条消息会在这个话题的独立上下文里继续。`, { title: "话题已创建", color: "green" });
+			return;
+		}
+
+		const renameMatch = subArg.match(/^(重命名|rename)\s+(.+)/i);
+		if (renameMatch) {
+			const topic = renameActiveTopic(chatId, workspace, renameMatch[2]);
+			if (!topic) {
+				await replyCard(messageId, "默认话题不能重命名；请先切换到一个自定义话题。", { title: "无法重命名", color: "orange" });
+				return;
+			}
+			await replyCard(messageId, `当前话题已重命名为：**${topicDisplayName(topic)}**`, { title: "话题已重命名", color: "green" });
+			return;
+		}
+
+		const deleteMatch = subArg.match(/^(删除|delete|remove|del)\s+(.+)/i);
+		if (deleteMatch) {
+			const topic = deleteTopic(chatId, workspace, deleteMatch[2]);
+			if (!topic) {
+				await replyCard(messageId, "未找到可删除的话题，或你正在删除默认话题。", { title: "无法删除", color: "orange" });
+				return;
+			}
+			await replyCard(messageId, `已删除话题：**${topicDisplayName(topic)}**\n\n如果它是当前话题，已回到默认话题。`, { title: "话题已删除", color: "green" });
+			return;
+		}
+
+		const switchMatch = subArg.match(/^(切换|switch|use)\s+(.+)/i);
+		const selector = switchMatch ? switchMatch[2].trim() : subArg;
+		const switched = switchTopic(chatId, workspace, selector);
+		if (switched) {
+			await replyCard(messageId, `已切换到话题：**${topicDisplayName(switched)}**\n\n下一条消息会沿用该话题上下文。`, { title: "话题已切换", color: "green" });
+			return;
+		}
+
+		const created = createOrSwitchTopic(chatId, workspace, selector);
+		if (created) {
+			await replyCard(messageId, `已创建并切换到话题：**${topicDisplayName(created)}**\n\n下一条消息会在这个话题的独立上下文里继续。`, { title: "话题已创建", color: "green" });
+			return;
+		}
+
+		await replyCard(messageId, "未找到话题。发送 `/话题` 查看列表，或 `/话题 新建 名称` 创建。", { title: "未找到", color: "orange" });
+		return;
+	}
+
+	if (/^\/(new|新对话|新会话)\s*$/i.test(prompt.trim())) {
+		archiveAndResetSession(topicSessionKey);
+		const historyCount = getSessionHistory(topicSessionKey).length;
+		const hint = historyCount > 0 ? `\n\n历史会话已保留（共 ${historyCount} 个），发送 \`/会话\` 可查看和切换。` : "";
+		const msg = `**[${label} / ${topicDisplayName(activeTopic)}]** 新会话已开始，下一条消息将创建全新对话。${hint}`;
+		if (cardId) await updateCard(cardId, msg, { title: "新会话", color: "blue" });
+		else await replyCard(messageId, msg, { title: "新会话", color: "blue" });
+		return;
+	}
+
+	// /会话、/sessions → 列出历史会话 / 切换会话
+	const sessionCmdMatch = prompt.match(/^\/(会话|sessions?)[\s:：]*(.*)/i);
+	if (sessionCmdMatch) {
+		const subArg = sessionCmdMatch[2].trim();
+		const history = getSessionHistory(topicSessionKey, 10);
+		const activeId = getActiveSessionId(topicSessionKey);
+
+		if (!subArg) {
+			if (history.length === 0) {
+				await replyCard(messageId, `当前话题「${topicDisplayName(activeTopic)}」暂无历史会话。\n\n开始对话后会自动记录，发送 \`/新对话\` 可归档当前会话。`, { title: "💬 会话列表", color: "blue" });
+				return;
+			}
+			const lines: string[] = [];
+			lines.push(`**工作区：** \`${label}\``);
+			lines.push(`**话题：** ${topicDisplayName(activeTopic)}\n`);
+			for (let i = 0; i < history.length; i++) {
+				const h = history[i];
+				const isCurrent = h.id === activeId;
+				const icon = isCurrent ? "🔵" : "⚪";
+				const tag = isCurrent ? " ← **当前**" : "";
+				const time = formatRelativeTime(h.lastActiveAt);
+				lines.push(`${icon} **${i + 1}.** ${h.summary}${tag}\n   ${time} · \`${h.id.slice(0, 8)}\``);
+			}
+			lines.push("", "---", "切换：`/会话 编号`　　新建：`/新对话`");
+			await replyCard(messageId, lines.join("\n"), { title: "💬 会话列表", color: "blue" });
+			return;
+		}
+
+		// /会话 N → 切换到第 N 个
+		const num = Number.parseInt(subArg, 10);
+		if (!Number.isNaN(num) && num >= 1 && num <= history.length) {
+			const target = history[num - 1];
+			if (target.id === activeId) {
+				await replyCard(messageId, `当前已是会话 #${num}：${target.summary}`, { title: "无需切换", color: "blue" });
+				return;
+			}
+			switchToSession(topicSessionKey, target.id);
+			await replyCard(messageId, `已切换到会话 #${num}：**${target.summary}**\n\n下一条消息将在此会话中继续对话。\n\`${target.id.slice(0, 12)}\` · ${formatRelativeTime(target.lastActiveAt)}`, { title: "💬 已切换", color: "green" });
+			console.log(`[Session] 切换到 ${target.id.slice(0, 12)} (${target.summary})`);
+			return;
+		}
+
+		// /会话 ID前缀 → 按 ID 前缀匹配
+		if (subArg.length >= 4) {
+			const target = history.find((h) => h.id.startsWith(subArg));
+			if (target) {
+				switchToSession(topicSessionKey, target.id);
+				await replyCard(messageId, `已切换到：**${target.summary}**\n\n\`${target.id.slice(0, 12)}\` · ${formatRelativeTime(target.lastActiveAt)}`, { title: "💬 已切换", color: "green" });
+				return;
+			}
+		}
+
+		await replyCard(messageId, `未找到编号 ${subArg} 的会话。\n\n发送 \`/会话\` 查看可用列表。`, { title: "未找到", color: "orange" });
+		return;
+	}
+
+	// 未知 / 指令 → 友好提示
+	if (text.startsWith("/")) {
+		const cmd = text.split(/[\s:：]/)[0];
+		await replyCard(messageId, `未知指令 \`${cmd}\`\n\n发送 \`/帮助\` 查看所有可用指令。`, { title: "未知指令", color: "orange" });
+		return;
+	}
+
+	const model = config.CURSOR_MODEL;
+
+	// 创建或复用卡片：全局排队卡片 → 同会话排队 → 处理中
+	const currentLockKey = getLockKey(topicSessionKey);
+	const needsSessionQueue = !cardId && busySessions.has(currentLockKey);
+	if (!cardId) {
+		const status = needsSessionQueue
+			? `⏳ 排队中（同会话有任务进行中）\n\n> ${prompt.slice(0, 120)}`
+			: `⏳ 正在执行...\n\n> ${prompt.slice(0, 120)}`;
+		cardId = await replyCard(messageId, status, {
+			title: needsSessionQueue ? "排队中" : "处理中",
+			color: needsSessionQueue ? "grey" : "wathet",
+		});
+	} else {
+		// 从全局排队卡片复用，看是否还需要等同会话锁
+		const status = busySessions.has(currentLockKey)
+			? `⏳ 排队中（同会话有任务进行中）\n\n> ${prompt.slice(0, 120)}`
+			: `⏳ 正在执行...\n\n> ${prompt.slice(0, 120)}`;
+		await updateCard(cardId, status, {
+			title: busySessions.has(currentLockKey) ? "排队中" : "处理中",
+			color: busySessions.has(currentLockKey) ? "grey" : "wathet",
+		});
+	}
+	console.log(`[Agent] 调用 Cursor CLI workspace=${workspace} topic=${topicDisplayName(activeTopic)} model=${model} card=${cardId}`);
+	if (cardId) {
+		rememberActiveTask({
+			cardId,
+			messageId,
+			chatId,
+			prompt: prompt.slice(0, 500),
+			startedAt: Date.now(),
+		});
+	}
+	const taskStart = Date.now();
+
+	// 记忆由 Cursor 自主通过 memory-tool.ts 调用，server 不注入
+	if (memory) {
+		memory.appendSessionLog(workspace, "user", prompt, model);
+	}
+
+	// runAgent 获取 session lock 后回调 onStart，更新卡片为"处理中"
+	const onStart = cardId
+		? () => {
+				updateCard(cardId!, `⏳ 正在执行...\n\n> ${prompt.slice(0, 120)}`, {
+					title: "处理中",
+					color: "wathet",
+				}).catch(() => {});
+			}
+		: undefined;
+
+	const onProgress = cardId
+		? (p: AgentProgress) => {
+				const time = formatElapsed(p.elapsed);
+				const phaseLabel = p.phase === "thinking" ? "🤔 思考中" : p.phase === "tool_call" ? "🔧 执行工具" : "💬 回复中";
+				const snippet = p.snippet.split("\n").filter((l) => l.trim()).slice(-4).join("\n");
+				updateCard(
+					cardId!,
+					`\`\`\`\n${snippet.slice(0, 300) || "..."}\n\`\`\``,
+					{ title: `${phaseLabel} · ${time}`, color: "wathet" },
+				).catch(() => {});
+			}
+		: undefined;
+
+	try {
+		const { result, quotaWarning } = await runAgent(workspace, prompt, { sessionKey: topicSessionKey, onProgress, onStart });
+		const usedModel = quotaWarning ? "auto" : model;
+		const elapsed = formatElapsed(Math.round((Date.now() - taskStart) / 1000));
+		console.log(`[${new Date().toISOString()}] 完成 [${label}/${topicDisplayName(activeTopic)}] model=${usedModel} elapsed=${elapsed} (${result.length} chars)`);
+
+		// 记录 assistant 回复到会话日志
+		if (memory) {
+			memory.appendSessionLog(workspace, "assistant", result.slice(0, 3000), usedModel);
+		}
+
+		// Agent 可能修改了 cron-jobs.json，重新加载调度器
+		scheduler.reload().catch(() => {});
+
+		const fullResult = quotaWarning ? `${quotaWarning}\n\n---\n\n${result}` : result;
+		const doneTitle = quotaWarning ? `完成 · ${elapsed}` : `完成 · ${elapsed}`;
+		const doneColor = quotaWarning ? "orange" : "green";
+
+		// 尝试发送 AI 结果到飞书卡片
+		let sendOk = false;
+		if (cardId && fullResult.length <= CARD_MAX) {
+			const { ok, error } = await updateCard(cardId, fullResult, { title: doneTitle, color: doneColor });
+			if (ok) {
+				sendOk = true;
+			} else {
+				// 卡片更新失败 → 让大模型知道，自己重新组织回复
+				console.log(`[重发] 卡片更新失败: ${error}，通知 AI 重新回复`);
+				await updateCard(cardId, `⏳ 回复格式超出飞书限制，正在重新组织...`, { title: "重新组织中", color: "wathet" });
+
+				const retryPrompt = [
+					"你的上一条回复发送到飞书时失败了。",
+					`失败原因：${error}`,
+					"",
+					"飞书卡片的限制：",
+					"- 单张卡片最多 5 个 Markdown 表格（这是最常见的失败原因）",
+					"- 卡片 JSON 总大小不超过 30KB（约 3500 中文字符）",
+					"",
+					"请重新回复刚才的内容，但要：",
+					"1. 表格最多用 3 个，其余改用列表（- 项目符号）",
+					"2. 精简文字，控制在 3000 字以内",
+					"3. 如果内容确实很多，先给核心结论，末尾说「需要我继续展开吗？」",
+					"4. 不要解释为什么格式变了，直接给内容",
+				].join("\n");
+
+				try {
+					const { result: retryResult } = await runAgent(workspace, retryPrompt, { sessionKey: topicSessionKey, onProgress });
+					const retryElapsed = formatElapsed(Math.round((Date.now() - taskStart) / 1000));
+					const { ok: retryOk } = await updateCard(cardId, retryResult, { title: `完成 · ${retryElapsed}`, color: doneColor });
+					if (retryOk) {
+						sendOk = true;
+						console.log(`[重发] AI 重新回复成功 (${retryResult.length} chars)`);
+					} else {
+						console.warn("[重发] AI 重新回复后仍然超限，回退纯文本分片");
+					}
+				} catch (retryErr) {
+					console.error("[重发] AI 重试失败:", retryErr);
+				}
+			}
+		}
+
+		// 卡片发送失败或内容过长 → 回退分片发送
+		if (!sendOk) {
+			if (cardId) {
+				await updateCard(cardId, quotaWarning || "执行完成，结果见下方", { title: doneTitle, color: doneColor });
+			}
+			await replyLongMessage(messageId, chatId, result, { title: doneTitle, color: "green" });
+		}
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		console.error(`[${new Date().toISOString()}] 失败 [${label}]: ${msg}`);
+		if (err instanceof Error && err.stack) console.error(`[Stack] ${err.stack}`);
+
+		const isAuthError = /authentication required|not authenticated|unauthorized|api.key/i.test(msg);
+		const body = isAuthError
+			? `**API Key 失效，请更换：**\n\n1. 打开 [Cursor Dashboard](https://cursor.com/dashboard) → Integrations → User API Keys\n2. 点 **Create API Key** 生成新 Key\n3. 在飞书发送：\`/apikey 你的新Key\`\n\n\`\`\`\n${msg.slice(0, 500)}\n\`\`\``
+			: `**执行失败**\n\n\`\`\`\n${msg.slice(0, 2000)}\n\`\`\``;
+		const title = isAuthError ? "API Key 失效" : "执行失败";
+
+		if (cardId) {
+			await updateCard(cardId, body, { title, color: "red" });
+		} else {
+			await replyCard(messageId, body, { title, color: "red" });
+		}
+	} finally {
+		forgetActiveTask(cardId);
+	}
+}
+
+// ── 飞书长连接 ───────────────────────────────────
+const dispatcher = new Lark.EventDispatcher({});
+const TYPES = new Set(["text", "image", "audio", "file", "post", "merge_forward"]);
+
+dispatcher.register({
+	"im.message.receive_v1": async (data) => {
+		console.log("[事件] 收到 im.message.receive_v1");
+		try {
+			const ev = data as Record<string, unknown>;
+			const msg = ev.message as Record<string, unknown>;
+			if (!msg) {
+				console.error("[事件] msg 为空");
+				return;
+			}
+			const messageType = msg.message_type as string;
+			const messageId = msg.message_id as string;
+			const chatId = msg.chat_id as string;
+			const chatType = (msg.chat_type as string) || "p2p";
+			const content = msg.content as string;
+
+			if (isDup(messageId)) return;
+			if (!TYPES.has(messageType)) {
+				await replyCard(messageId, `暂不支持: ${messageType}`);
+				return;
+			}
+
+			let parsedText = "";
+			let imageKey: string | undefined;
+			let fileKey: string | undefined;
+			if (messageType === "merge_forward") {
+				try {
+					parsedText = await expandMergeForwardMessage(messageId);
+				} catch (err) {
+					const msgText = err instanceof Error ? err.message : String(err);
+					console.error("[合并转发解析失败]", msgText);
+					await replyCard(
+						messageId,
+						`合并转发解析失败：${msgText}\n\n可以临时改用“直接发送 PDF 文件”的方式发给我。`,
+						{ title: "合并转发解析失败", color: "red" },
+					);
+					return;
+				}
+			} else {
+				const parsed = parseContent(messageType, content);
+				parsedText = parsed.text;
+				imageKey = parsed.imageKey;
+				fileKey = parsed.fileKey;
+			}
+			console.log(`[解析] type=${messageType} chat=${chatType} text="${parsedText.slice(0, 60)}" img=${imageKey ?? ""} file=${fileKey ?? ""}`);
+			handle({ text: parsedText.trim(), messageId, chatId, chatType, messageType, content }).catch(console.error);
+		} catch (e) {
+			console.error("[事件异常]", e);
+		}
+	},
+});
+
+const ws = new Lark.WSClient({
+	appId: config.FEISHU_APP_ID,
+	appSecret: config.FEISHU_APP_SECRET,
+	domain: Lark.Domain.Feishu,
+	loggerLevel: Lark.LoggerLevel.info,
+});
+
+// ── 启动 ─────────────────────────────────────────
+const list = Object.entries(projectsConfig.projects)
+	.map(([k, v]) => `  ${k} → ${v.path}`)
+	.join("\n");
+const sttEngine = config.VOLC_STT_APP_ID ? "火山引擎豆包大模型" : "本地 whisper";
+const memEngine = memory ? `豆包 Embedding (${config.VOLC_EMBEDDING_MODEL})` : "未启用";
+console.log(`
+┌──────────────────────────────────────────────────┐
+│  飞书 → Cursor Agent 中继服务 v5                 │
+│  架构: OpenClaw 风格 (rules 自动加载)            │
+├──────────────────────────────────────────────────┤
+│  模型: ${config.CURSOR_MODEL}
+│  Key:  ...${config.CURSOR_API_KEY.slice(-8)}
+│  连接: 飞书 WebSocket 长连接
+│  收件: ${INBOX_DIR}
+│  语音: ${sttEngine}
+│  记忆: ${memEngine}
+│  调度: cron-jobs.json (文件监听)
+│  心跳: 默认关闭（飞书 /心跳 开启）
+│  自检: .cursor/BOOT.md（每次启动执行）
+│
+│  规则（每次会话自动加载）:
+│    soul.mdc, agent-identity.mdc, user-context.mdc
+│    workspace-rules.mdc, tools.mdc, memory-protocol.mdc
+│    scheduler-protocol.mdc, heartbeat-protocol.mdc
+│    cursor-capabilities.mdc
+│  记忆索引: 全工作区文本文件（memory-tool.ts）
+│
+│  回复: 互动卡片 + 消息更新
+│  直连: 飞书消息 → Cursor CLI（stream-json + --resume）
+│
+│  项目路由:
+${list}
+│
+│  热更换: 编辑 .env 即可
+└──────────────────────────────────────────────────┘
+`);
+
+// 启动定时任务调度器
+scheduler.start().catch((e) => console.warn(`[调度] 启动失败: ${e}`));
+
+heartbeat.start();
+
+await ws.start({ eventDispatcher: dispatcher });
+console.log("飞书长连接已启动，等待消息...");
+await recoverInterruptedTasks();
+
+// Windows/Bun can let the process exit after WS startup if no ref'ed handle remains.
+// Keep one lightweight timer alive for the single-bot Windows trial wrapper.
+setInterval(() => {}, 60_000);
+
+// ── 启动自检（.cursor/BOOT.md）───────────────────────
+if (process.env.ENABLE_BOOT_CHECK === "1") {
+setTimeout(async () => {
+	const bootPath = resolve(defaultWorkspace, ".cursor/BOOT.md");
+	try {
+		if (!existsSync(bootPath)) return;
+		const content = readFileSync(bootPath, "utf-8").trim();
+		if (!content) return;
+		console.log("[启动] 检测到 .cursor/BOOT.md，执行启动自检...");
+		const bootPrompt = [
+			"你正在执行启动自检。严格按 .cursor/BOOT.md 指示操作。",
+			"如果无事可做，不需要回复任何内容。",
+		].join("\n");
+		const { result } = await runAgent(defaultWorkspace, bootPrompt);
+		const trimmed = result.trim();
+		if (trimmed && !/^(无输出|HEARTBEAT_OK)$/i.test(trimmed) && lastActiveChatId) {
+			await sendCard(lastActiveChatId, trimmed, { title: "🚀 启动自检", color: "wathet" });
+		}
+		console.log("[启动] .cursor/BOOT.md 自检完成");
+	} catch (e) {
+		console.warn(`[启动] .cursor/BOOT.md 执行失败: ${e}`);
+	} finally {
+		archiveAndResetSession(defaultWorkspace);
+	}
+}, 8000);
+} else {
+	console.log("[启动] .cursor/BOOT.md 自检已跳过（设置 ENABLE_BOOT_CHECK=1 可开启）");
+}

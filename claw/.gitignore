@@ -1,0 +1,64 @@
+# dependencies
+node_modules/
+
+# environment (contains secrets)
+.env
+.env.local
+.env.*.local
+
+# output
+out/
+dist/
+*.tgz
+
+# logs
+*.log
+
+# caches
+.cache/
+*.tsbuildinfo
+
+# Python cache
+__pycache__/
+*.pyc
+
+# turix-cua temp files (logs, screenshots, memory)
+.turix_tmp/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+
+# media inbox (runtime data)
+../inbox/
+
+# memory system (runtime data)
+.sessions.json
+.memory.sqlite
+.memory.sqlite-wal
+.memory.sqlite-shm
+.cursor/memory/
+.cursor/sessions/
+
+
+# === SECURITY: AI agent transcripts & sessions often leak credentials (added 2026-04-19) ===
+.cursor/projects/
+**/agent-transcripts/
+**/.cursor/scripts/sessions/
+.cursor/scripts/logs/
+.last-chat-id
+
+# === SECURITY: credential-like files ===
+**/credentials*
+**/*.credentials.json
+**/secrets.json
+**/*.pem
+**/*.key
+**/id_rsa*
+.env*
+!.env.example
+!.env.template

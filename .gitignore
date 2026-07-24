@@ -1,0 +1,31 @@
+# Secrets and local identity
+config/bridge.env
+claw/.env
+projects.json
+claw/.sessions.json
+claw/.topics.json
+
+# Runtime data and migration bundles can contain attachments, sessions, or secrets.
+runtime/
+inbox/
+migration-packages/
+.migration/
+
+# Generated dependencies and logs
+claw/node_modules/
+*.log
+
+# Personal workspace content and optional third-party/reference material.
+# The bridge creates its runtime workspace from claw/templates/ during setup.
+claw/.cursor/
+claw/文档/
+claw/参考代码/
+claw/瑞小美-harness/
+claw/plugins/
+claw/AGENTS.md
+claw/README.md
+claw/架构.md
+
+# Local editor and operating-system files
+.DS_Store
+Thumbs.db

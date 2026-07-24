@@ -1,0 +1,9 @@
+{
+  "projects": {
+    "local": {
+      "path": "__BRIDGE_RUNTIME__",
+      "description": "Bridge runtime workspace"
+    }
+  },
+  "default_project": "local"
+}

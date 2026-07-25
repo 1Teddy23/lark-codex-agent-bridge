@@ -2,8 +2,7 @@ param(
   [Parameter(Mandatory = $true)]
   [string] $Commit,
 
-  [Parameter(Mandatory = $true)]
-  [string] $Root
+  [string] $Root = "D:\Agent\lark-agent-bridge-migration-20260719-175640\lark-agent-bridge"
 )
 
 $ErrorActionPreference = "Stop"

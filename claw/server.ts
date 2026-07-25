@@ -1245,6 +1245,10 @@ function isCancellationError(text: string): boolean {
 	return /任务已被用户中止|user aborted|aborted|cancelled|canceled|terminated/i.test(text);
 }
 
+function isCodexCompactionError(text: string): boolean {
+	return /compact_remote|remote compaction|pre-sampling compact|context_window_tokens|context window/i.test(text);
+}
+
 const childPids = new Set<number>();
 
 function killProcessTree(pid: number): void {
@@ -1882,6 +1886,7 @@ function execAgent(
 
 		let stderr = "";
 		let resultText = "";
+		let agentErrorText = "";
 		let sessionId: string | undefined;
 		let phase: AgentProgress["phase"] = "thinking";
 		let thinkingBuf = "";
@@ -1966,9 +1971,10 @@ function execAgent(
 					}
 					break;
 				case "result":
-					if (ev.result != null) resultText = ev.result;
 					if (ev.subtype === "error" && ev.error) {
-						resultText = ev.error;
+						agentErrorText = String(ev.error);
+					} else if (ev.result != null) {
+						resultText = ev.result;
 					}
 					break;
 			}
@@ -2006,6 +2012,11 @@ function execAgent(
 
 			if (cancelled) {
 				reject(new Error("任务已被用户中止"));
+				return;
+			}
+
+			if (agentErrorText) {
+				reject(new Error(agentErrorText));
 				return;
 			}
 
@@ -2941,15 +2952,19 @@ async function handleInner(
 		if (err instanceof Error && err.stack) console.error(`[Stack] ${err.stack}`);
 
 		const isAuthError = /authentication required|not authenticated|unauthorized|api.key/i.test(msg);
+		const isCompactionError = isCodexCompactionError(msg);
 		const body = isAuthError
 			? `**API Key 失效，请更换：**\n\n1. 打开 [Cursor Dashboard](https://cursor.com/dashboard) → Integrations → User API Keys\n2. 点 **Create API Key** 生成新 Key\n3. 在飞书发送：\`/apikey 你的新Key\`\n\n\`\`\`\n${msg.slice(0, 500)}\n\`\`\``
+			: isCompactionError
+				? "**当前话题的上下文过长，Codex 整理历史时遇到临时服务异常。**\n\n已自动归档并重置本话题的会话。请稍后重新发送刚才的任务；新的会话会正常处理。"
 			: `**执行失败**\n\n\`\`\`\n${msg.slice(0, 2000)}\n\`\`\``;
-		const title = isAuthError ? "API Key 失效" : "执行失败";
+		const title = isAuthError ? "API Key 失效" : isCompactionError ? "会话已重置" : "执行失败";
+		const color = isCompactionError ? "orange" : "red";
 
 		if (cardId) {
-			await updateCard(cardId, body, { title, color: "red" });
+			await updateCard(cardId, body, { title, color });
 		} else {
-			await replyCard(messageId, body, { title, color: "red" });
+			await replyCard(messageId, body, { title, color });
 		}
 	} finally {
 		forgetActiveTask(cardId);

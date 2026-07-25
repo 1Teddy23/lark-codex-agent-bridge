@@ -117,6 +117,7 @@ $lastPath = Join-Path $tempDir "$runId.last.txt"
 $threadId = ""
 $assistantText = ""
 $stderrText = ""
+$codexErrorText = ""
 $exitCode = 1
 
 function Get-SessionId {
@@ -253,13 +254,9 @@ function Process-CodexLine {
   }
 
   if ($event.type -eq "error") {
-    $message = if ($event.message) { [string]$event.message } else { $trimmed }
-    Write-JsonLine @{
-      type = "result"
-      subtype = "error"
-      session_id = (Get-SessionId)
-      error = $message
-    }
+    # Do not let --output-last-message turn a failed Codex turn into a normal
+    # assistant reply when the child process exits.
+    $script:codexErrorText = if ($event.message) { [string]$event.message } else { $trimmed }
   }
 }
 
@@ -330,6 +327,19 @@ try {
   if ($stderrText) {
     [IO.File]::WriteAllText($stderrPath, $stderrText, [Text.Encoding]::UTF8)
   }
+}
+
+if ($codexErrorText) {
+  Write-JsonLine @{
+    type = "result"
+    subtype = "error"
+    session_id = (Get-SessionId)
+    error = $codexErrorText
+  }
+  if ($env:CODEX_ADAPTER_KEEP_LOGS -ne "1") {
+    Remove-Item -LiteralPath $eventsPath, $stderrPath, $lastPath -ErrorAction SilentlyContinue
+  }
+  exit 0
 }
 
 if (-not $assistantText -and (Test-Path -LiteralPath $lastPath)) {

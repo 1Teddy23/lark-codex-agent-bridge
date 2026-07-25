@@ -80,6 +80,7 @@ const lastPath = path.join(tempDir, `${runId}.last.txt`);
 let threadId = "";
 let assistantText = "";
 let stderrText = "";
+let codexErrorText = "";
 let child = null;
 let timedOut = false;
 let completionGraceHandle = null;
@@ -209,13 +210,10 @@ function processCodexLine(line) {
     return;
   }
 
-  if (bridgeOutput && event.type === "error") {
-    writeJsonLine({
-      type: "result",
-      subtype: "error",
-      session_id: sessionId(),
-      error: String(event.message || trimmed),
-    });
+  if (event.type === "error") {
+    // A Codex error event is terminal for this turn. Do not turn it into a
+    // successful assistant response from --output-last-message on process exit.
+    codexErrorText = String(event.message || trimmed);
   }
 }
 
@@ -354,6 +352,21 @@ child.on("close", (code) => {
     } catch {
       // Best-effort diagnostics.
     }
+  }
+
+  if (codexErrorText.trim()) {
+    if (bridgeOutput) {
+      writeJsonLine({
+        type: "result",
+        subtype: "error",
+        session_id: sessionId(),
+        error: codexErrorText.trim(),
+      });
+    } else {
+      process.stdout.write(codexErrorText.trim());
+    }
+    cleanup();
+    process.exit(0);
   }
 
   if (!assistantText && fs.existsSync(lastPath)) {

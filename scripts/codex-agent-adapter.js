@@ -163,12 +163,23 @@ function processCodexLine(line) {
   if (event.type === "turn.completed") {
     // Codex can emit the final response but leave its CLI process alive. Give
     // normal shutdown a short grace period, then release the bridge using the
-    // response already received on the event stream.
+    // response already received on the event stream. On Windows the primary
+    // CLI process can exit while a descendant keeps stdout open, preventing
+    // the ChildProcess "close" event indefinitely.
     if (assistantText.trim() && !completionGraceHandle) {
       completionGraceHandle = setTimeout(() => {
         if (child && child.exitCode === null && !child.killed) {
           killChildTree();
         }
+        if (bridgeOutput) {
+          writeJsonLine({
+            type: "result",
+            session_id: sessionId(),
+            result: assistantText,
+          });
+        }
+        cleanup();
+        process.exit(0);
       }, 15_000);
     }
     return;

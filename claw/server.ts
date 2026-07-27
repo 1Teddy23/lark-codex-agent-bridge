@@ -1339,6 +1339,7 @@ interface TopicEntry {
 	createdAt: number;
 	lastActiveAt: number;
 	sessionKey: string;
+	rootMessageId?: string;
 }
 
 interface WorkspaceTopics {
@@ -1441,6 +1442,12 @@ function normalizeTopicName(input: string): string {
 		.slice(0, 50);
 }
 
+function autoTopicName(prompt: string): string {
+	const compact = prompt.replace(/\s+/g, " ").trim();
+	if (!compact) return "未命名问题";
+	return normalizeTopicName(compact.length > 32 ? `${compact.slice(0, 32)}...` : compact);
+}
+
 function projectLabelForWorkspace(workspace: string): string {
 	const realWorkspace = workspace.split("::chat:")[0];
 	return Object.entries(projectsConfig.projects).find(([, v]) => v.path === realWorkspace)?.[0] || realWorkspace;
@@ -1495,6 +1502,36 @@ function getActiveTopic(chatId: string, workspace: string): TopicEntry {
 		saveTopics();
 	}
 	topic.lastActiveAt = Date.now();
+	saveTopics();
+	return topic;
+}
+
+function resolveMessageTopic(
+	chatId: string,
+	workspace: string,
+	rootMessageId: string,
+	prompt: string,
+): TopicEntry {
+	const scope = ensureTopicScope(chatId, workspace);
+	const existing = scope.topics.find((topic) => topic.rootMessageId === rootMessageId);
+	if (existing) {
+		scope.active = existing.id;
+		existing.lastActiveAt = Date.now();
+		saveTopics();
+		return existing;
+	}
+
+	const topicId = randomUUID();
+	const topic: TopicEntry = {
+		id: topicId,
+		name: autoTopicName(prompt),
+		createdAt: Date.now(),
+		lastActiveAt: Date.now(),
+		sessionKey: buildTopicSessionKey(chatId, workspace, topicId),
+		rootMessageId,
+	};
+	scope.topics.unshift(topic);
+	scope.active = topic.id;
 	saveTopics();
 	return topic;
 }
@@ -2148,23 +2185,25 @@ function isDup(id: string): boolean {
 async function handle(params: {
 	text: string;
 	messageId: string;
+	rootMessageId: string;
 	chatId: string;
 	chatType: string;
 	messageType: string;
 	content: string;
 }) {
-	const { messageId, chatId, chatType, messageType, content } = params;
+	const { messageId, rootMessageId, chatId, chatType, messageType, content } = params;
 	let { text } = params;
 	// 记录最近活跃会话用于定时任务/心跳主动推送
 	lastActiveChatId = chatId;
 	console.log(`[${new Date().toISOString()}] [${messageType}] ${text.slice(0, 80)}`);
 
-	return handleInner(text, messageId, chatId, chatType, messageType, content);
+	return handleInner(text, messageId, rootMessageId, chatId, chatType, messageType, content);
 }
 
 async function handleInner(
 	text: string,
 	messageId: string,
+	rootMessageId: string,
 	chatId: string,
 	chatType: string,
 	messageType: string,
@@ -2658,8 +2697,8 @@ async function handleInner(
 
 	// /new、/新对话、/新会话 → 归档当前会话，开启新对话
 	const { workspace, prompt, label } = route(text);
-	const activeTopic = getActiveTopic(chatId, workspace);
-	const topicSessionKey = activeTopic.sessionKey;
+	let activeTopic = getActiveTopic(chatId, workspace);
+	let topicSessionKey = activeTopic.sessionKey;
 
 	// /话题、/topic → 当前聊天内按话题隔离 Codex 会话
 	const topicCmdMatch = prompt.match(/^\/(话题|topics?)[\s:：]*(.*)/i);
@@ -2814,6 +2853,18 @@ async function handleInner(
 		const cmd = text.split(/[\s:：]/)[0];
 		await replyCard(messageId, `未知指令 \`${cmd}\`\n\n发送 \`/帮助\` 查看所有可用指令。`, { title: "未知指令", color: "orange" });
 		return;
+	}
+
+	const keepsManualTopic =
+		rootMessageId === messageId &&
+		activeTopic.id !== DEFAULT_TOPIC_ID &&
+		!activeTopic.rootMessageId;
+	if (keepsManualTopic) {
+		activeTopic.lastActiveAt = Date.now();
+		saveTopics();
+	} else {
+		activeTopic = resolveMessageTopic(chatId, workspace, rootMessageId, prompt);
+		topicSessionKey = activeTopic.sessionKey;
 	}
 
 	const model = config.CURSOR_MODEL;
@@ -3020,7 +3071,16 @@ dispatcher.register({
 				fileKey = parsed.fileKey;
 			}
 			console.log(`[解析] type=${messageType} chat=${chatType} text="${parsedText.slice(0, 60)}" img=${imageKey ?? ""} file=${fileKey ?? ""}`);
-			handle({ text: parsedText.trim(), messageId, chatId, chatType, messageType, content }).catch(console.error);
+			const rootMessageId = (msg.root_id as string | undefined) || messageId;
+			handle({
+				text: parsedText.trim(),
+				messageId,
+				rootMessageId,
+				chatId,
+				chatType,
+				messageType,
+				content,
+			}).catch(console.error);
 		} catch (e) {
 			console.error("[事件异常]", e);
 		}
